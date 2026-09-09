@@ -1,0 +1,8 @@
+# Generated build and verification outputs
+dist/*
+!dist/.gitkeep
+
+# Local editor and temporary files
+*.user
+*.suo
+*.tmp
