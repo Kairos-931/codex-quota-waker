@@ -13,11 +13,11 @@
 
 ## Active development
 
-- Requirement: `docs/requirements/REQ-20260922-simplify-request-route-test.md`
+- Requirement: none
 - Started: `2026-09-22`
-- Approved execution profile: `gpt-5.6-luna / max`
-- Visual QA authorization: approved before development; one minimal Windows foreground check of the request-route card, estimated 3–5 minutes, without sending a real request or changing the user plan.
-- Delivery: implemented in the bound developer task; formal build and verification passed. The approved visual check was attempted but the current Computer Use surface did not expose the WinForms window, so no visual assertion is claimed.
+- Approved execution profile: `gpt-5.6-luna / max` (confirmation option `0`)
+- Visual QA: not required or authorized; deterministic build, self-check, and time-boundary tests only.
+- Delivery: completed in the bound developer task; no real Codex request, route change, plan installation, desktop control, or git push was performed.
 - Queue: empty
 
 ## Operating contract
@@ -32,6 +32,13 @@
 8. Product-impacting ambiguity returns to the requirements task; implementation details remain with the developer task.
 
 ## Latest completed development
+
+- Requirement: `docs/requirements/REQ-20260922-align-schedule-to-quota-reset.md`
+- Status: implemented and formally verified on 2026-09-23
+- Developer task: `codex://threads/01a07f70-dd43-7292-9ebb-497bc178b349`
+- Approved execution profile: `gpt-5.6-luna / max`
+- Version: `0.12.0`
+- Verification: `scripts/build.ps1` and `scripts/verify.ps1` passed; structured reset evidence, timezone conversion, strict next-minute rounding, missing-timezone, conflicting-value, zero-sequence, and past-time safeguards passed. No real Codex request, user plan change, task installation, desktop control, or git push was performed.
 
 - Requirement: `docs/requirements/REQ-20260922-simplify-request-route-test.md`
 - Status: implemented and formally verified on 2026-09-22

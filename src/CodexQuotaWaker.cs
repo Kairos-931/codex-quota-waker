@@ -22,9 +22,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.11.0.0")]
-[assembly: AssemblyFileVersion("0.11.0.0")]
-[assembly: AssemblyInformationalVersion("0.11.0")]
+[assembly: AssemblyVersion("0.12.0.0")]
+[assembly: AssemblyFileVersion("0.12.0.0")]
+[assembly: AssemblyInformationalVersion("0.12.0")]
 
 namespace CodexQuotaWaker
 {
@@ -271,6 +271,8 @@ namespace CodexQuotaWaker
         public double? UsedPercent { get; set; }
         public long? ResetsAtUnix { get; set; }
         public string ResetAtLocal { get; set; }
+        public bool HasReliableResetTime { get; set; }
+        public string ResetTimeDiagnostic { get; set; }
         public string PlanType { get; set; }
         public string QuotaDiagnostic { get; set; }
         public string FinalModel { get; set; }
@@ -299,6 +301,7 @@ namespace CodexQuotaWaker
             QuotaStatus = string.Empty;
             LimitId = string.Empty;
             ResetAtLocal = string.Empty;
+            ResetTimeDiagnostic = string.Empty;
             PlanType = string.Empty;
             QuotaDiagnostic = string.Empty;
             FinalModel = string.Empty;
@@ -1656,6 +1659,10 @@ namespace CodexQuotaWaker
         public double? UsedPercent { get; set; }
         public long? ResetsAtUnix { get; set; }
         public string ResetAtLocal { get; set; }
+        public bool HasReliableResetTime { get; set; }
+        public string ResetTimeDiagnostic { get; set; }
+        public List<long> ResetCandidatesUnix { get; private set; }
+        public bool HasInvalidResetEvidence { get; set; }
         public string PlanType { get; set; }
         public string Diagnostic { get; set; }
         public int ParsedEventCount { get; set; }
@@ -1670,6 +1677,8 @@ namespace CodexQuotaWaker
             QuotaStatus = "unconfirmed";
             LimitId = string.Empty;
             ResetAtLocal = string.Empty;
+            ResetTimeDiagnostic = string.Empty;
+            ResetCandidatesUnix = new List<long>();
             PlanType = string.Empty;
             Diagnostic = string.Empty;
         }
@@ -1711,6 +1720,8 @@ namespace CodexQuotaWaker
                     analysis.Diagnostic = "Codex JSONL 输出中没有本次 session/thread id，无法精确读取会话补充证据。";
                 }
 
+                FinalizeResetEvidence(analysis);
+
                 record.SessionId = analysis.SessionId;
                 bool providerFromRemoteError = !string.IsNullOrWhiteSpace(analysis.Provider)
                     && route != null
@@ -1724,8 +1735,9 @@ namespace CodexQuotaWaker
                     record.UpstreamProvider = analysis.Provider;
                     record.UpstreamEvidence = "Codex JSON 错误信息报告了实际上游 provider。";
                 }
-                // Legacy quota fields remain readable in old JSON, but the active
-                // request flow no longer reads or judges an official quota bucket.
+                // Legacy quota fields remain readable in old JSON. The active request
+                // flow only reads narrow structured reset evidence for schedule preview;
+                // it never uses that evidence to judge request success or quota status.
                 record.OfficialQuotaConfirmed = false;
                 record.QuotaStatus = "unconfirmed";
                 record.LimitId = analysis.LimitId;
@@ -1733,6 +1745,8 @@ namespace CodexQuotaWaker
                 record.UsedPercent = analysis.UsedPercent;
                 record.ResetsAtUnix = analysis.ResetsAtUnix;
                 record.ResetAtLocal = analysis.ResetAtLocal;
+                record.HasReliableResetTime = analysis.HasReliableResetTime;
+                record.ResetTimeDiagnostic = analysis.ResetTimeDiagnostic;
                 record.PlanType = analysis.PlanType;
                 record.QuotaDiagnostic = analysis.Diagnostic;
                 record.FinalModel = analysis.FinalModel;
@@ -1884,13 +1898,128 @@ namespace CodexQuotaWaker
                     }
                 }
 
+                Dictionary<string, object> payloadRateLimits = GetObject(payload, "rate_limits");
+                if (payloadRateLimits != null)
+                {
+                    ApplyRateLimitResetEvidence(result, payloadRateLimits);
+                }
+                Dictionary<string, object> rootRateLimits = GetObject(root, "rate_limits");
+                if (rootRateLimits != null)
+                {
+                    ApplyRateLimitResetEvidence(result, rootRateLimits);
+                }
+
                 string finalText = ExtractAssistantText(root, payload, payloadType);
                 if (!string.IsNullOrWhiteSpace(finalText))
                 {
                     result.FinalText = finalText.Trim();
                 }
             }
+            FinalizeResetEvidence(result);
             return result;
+        }
+
+        private static void ApplyRateLimitResetEvidence(CodexRunAnalysis result, Dictionary<string, object> rateLimits)
+        {
+            if (!string.Equals(GetString(rateLimits, "limit_id"), "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            Dictionary<string, object> primary = GetObject(rateLimits, "primary");
+            if (primary == null || GetInt(primary, "window_minutes") != 300)
+            {
+                return;
+            }
+
+            string rawReset = GetString(primary, "resets_at");
+            long? resetUnix = ParseResetUnix(rawReset);
+            if (!resetUnix.HasValue)
+            {
+                result.HasInvalidResetEvidence = true;
+                result.ResetTimeDiagnostic = "本次响应的额度重置字段缺少有效且带时区的时间。";
+                return;
+            }
+
+            if (!result.ResetCandidatesUnix.Contains(resetUnix.Value))
+            {
+                result.ResetCandidatesUnix.Add(resetUnix.Value);
+            }
+        }
+
+        private static void FinalizeResetEvidence(CodexRunAnalysis result)
+        {
+            if (result.ResetCandidatesUnix.Count > 1)
+            {
+                result.ResetsAtUnix = null;
+                result.ResetAtLocal = string.Empty;
+                result.HasReliableResetTime = false;
+                result.ResetTimeDiagnostic = "本次响应包含冲突的额度重置时间。";
+                return;
+            }
+
+            if (result.HasInvalidResetEvidence)
+            {
+                result.ResetsAtUnix = null;
+                result.ResetAtLocal = string.Empty;
+                result.HasReliableResetTime = false;
+                result.ResetTimeDiagnostic = result.ResetCandidatesUnix.Count == 0
+                    ? "本次响应的额度重置字段缺少有效且带时区的时间。"
+                    : "本次响应同时包含有效和无效的额度重置时间，无法确认唯一可靠值。";
+                return;
+            }
+
+            if (result.ResetCandidatesUnix.Count == 1)
+            {
+                result.ResetsAtUnix = result.ResetCandidatesUnix[0];
+                try
+                {
+                    result.ResetAtLocal = DateTimeOffset.FromUnixTimeSeconds(result.ResetsAtUnix.Value)
+                        .ToLocalTime()
+                        .ToString("yyyy-MM-dd HH:mm:ss zzz", CultureInfo.InvariantCulture);
+                    result.HasReliableResetTime = true;
+                    result.ResetTimeDiagnostic = "已获得唯一且可靠的额度重置时间。";
+                }
+                catch
+                {
+                    result.ResetsAtUnix = null;
+                    result.ResetAtLocal = string.Empty;
+                    result.HasReliableResetTime = false;
+                    result.ResetTimeDiagnostic = "本次响应的额度重置时间超出 Windows 可表示范围。";
+                }
+                return;
+            }
+
+            result.ResetsAtUnix = null;
+            result.ResetAtLocal = string.Empty;
+            result.HasReliableResetTime = false;
+            result.ResetTimeDiagnostic = string.IsNullOrWhiteSpace(result.ResetTimeDiagnostic)
+                ? "本次响应未提供唯一且可靠的额度重置时间。"
+                : result.ResetTimeDiagnostic;
+        }
+
+        private static long? ParseResetUnix(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return null;
+            }
+
+            long unix;
+            if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out unix))
+            {
+                return unix > 0 ? (long?)unix : null;
+            }
+
+            DateTimeOffset parsed;
+            bool hasExplicitOffset = Regex.IsMatch(raw.Trim(), @"(?:Z|[+-]\d{2}:?\d{2})$", RegexOptions.IgnoreCase);
+            if (hasExplicitOffset
+                && DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out parsed))
+            {
+                long value = parsed.ToUnixTimeSeconds();
+                return value > 0 ? (long?)value : null;
+            }
+            return null;
         }
 
         private static string ExtractAssistantText(Dictionary<string, object> root, Dictionary<string, object> payload, string payloadType)
@@ -1992,6 +2121,14 @@ namespace CodexQuotaWaker
             if (string.IsNullOrWhiteSpace(first.Provider)) first.Provider = second.Provider;
             if (string.IsNullOrWhiteSpace(first.FinalText)) first.FinalText = second.FinalText;
             if (string.IsNullOrWhiteSpace(first.LimitId)) first.LimitId = second.LimitId;
+            foreach (long candidate in second.ResetCandidatesUnix)
+            {
+                if (!first.ResetCandidatesUnix.Contains(candidate))
+                {
+                    first.ResetCandidatesUnix.Add(candidate);
+                }
+            }
+            first.HasInvalidResetEvidence = first.HasInvalidResetEvidence || second.HasInvalidResetEvidence;
             if (!first.OfficialQuotaConfirmed) first.OfficialQuotaConfirmed = second.OfficialQuotaConfirmed;
             if (string.IsNullOrWhiteSpace(first.QuotaStatus) || first.QuotaStatus == "unconfirmed") first.QuotaStatus = second.QuotaStatus;
             if (first.WindowMinutes <= 0) first.WindowMinutes = second.WindowMinutes;
@@ -2175,6 +2312,81 @@ namespace CodexQuotaWaker
                 return "请确认当前 Codex / CC Switch 配置能够返回模型回复，再重新测试。";
             }
             return "请打开日志查看脱敏诊断，确认当前 Codex / CC Switch 配置后重新测试。";
+        }
+    }
+
+    internal sealed class ResetScheduleAdjustment
+    {
+        public bool Applied { get; set; }
+        public DateTime LocalStart { get; set; }
+        public string Message { get; set; }
+
+        public ResetScheduleAdjustment()
+        {
+            Message = string.Empty;
+        }
+    }
+
+    internal static class ResetSchedulePlanner
+    {
+        public static ResetScheduleAdjustment Evaluate(RunRecord record, int sequenceCount, DateTime now)
+        {
+            ResetScheduleAdjustment result = new ResetScheduleAdjustment();
+            if (sequenceCount <= 0)
+            {
+                result.Message = "当前未启用执行序列，计划未调整。";
+                return result;
+            }
+            if (record == null || !record.Success)
+            {
+                result.Message = "本次请求未成功，计划未调整。";
+                return result;
+            }
+            if (!record.HasReliableResetTime || !record.ResetsAtUnix.HasValue)
+            {
+                result.Message = string.IsNullOrWhiteSpace(record.ResetTimeDiagnostic)
+                    ? "本次未获得可靠额度重置时间，计划未调整。"
+                    : record.ResetTimeDiagnostic + "计划未调整。";
+                return result;
+            }
+
+            DateTimeOffset reset;
+            try
+            {
+                reset = DateTimeOffset.FromUnixTimeSeconds(record.ResetsAtUnix.Value).ToLocalTime();
+            }
+            catch
+            {
+                result.Message = "额度重置时间无法转换为 Windows 本地时间，计划未调整。";
+                return result;
+            }
+
+            if (reset.DateTime <= now)
+            {
+                result.Message = "额度重置时间已过去，计划未调整。";
+                return result;
+            }
+
+            DateTime nextMinute = new DateTime(
+                reset.Year,
+                reset.Month,
+                reset.Day,
+                reset.Hour,
+                reset.Minute,
+                0,
+                DateTimeKind.Unspecified).AddMinutes(1);
+            if (nextMinute <= now)
+            {
+                result.Message = "额度重置后的可调度时间已过去，计划未调整。";
+                return result;
+            }
+
+            result.Applied = true;
+            result.LocalStart = nextMinute;
+            result.Message = "已根据额度重置时间调整为 "
+                + nextMinute.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+                + "，尚未保存。";
+            return result;
         }
     }
 
@@ -3338,6 +3550,81 @@ namespace CodexQuotaWaker
                 lines.Add("RouteTestRecognizesFinalModel=" + recognizedOk);
                 success = success && recognizedOk;
 
+                DateTimeOffset expectedResetLocal = DateTimeOffset.FromUnixTimeSeconds(newWindowReset).ToLocalTime();
+                DateTime expectedAdjusted = new DateTime(
+                    expectedResetLocal.Year,
+                    expectedResetLocal.Month,
+                    expectedResetLocal.Day,
+                    expectedResetLocal.Hour,
+                    expectedResetLocal.Minute,
+                    0,
+                    DateTimeKind.Unspecified).AddMinutes(1);
+                ResetScheduleAdjustment resetAdjustment = ResetSchedulePlanner.Evaluate(
+                    recognized,
+                    1,
+                    fixtureNow);
+                bool resetEvidenceOk = recognized.HasReliableResetTime
+                    && recognized.ResetsAtUnix == newWindowReset
+                    && resetAdjustment.Applied
+                    && resetAdjustment.LocalStart == expectedAdjusted
+                    && resetAdjustment.Message.IndexOf("尚未保存", StringComparison.Ordinal) >= 0;
+                lines.Add("QuotaResetEvidenceAndNextMinute=" + resetEvidenceOk);
+                success = success && resetEvidenceOk;
+
+                string isoResetJson = @"{""type"":""event_msg"",""payload"":{""rate_limits"":{""limit_id"":""codex"",""primary"":{""window_minutes"":300,""resets_at"":""2026-09-20T23:08:42+08:00""}}}}
+{""type"":""item.completed"",""item"":{""type"":""agent_message"",""text"":""ok""}}";
+                RunRecord isoReset = AnalyzeFixture(isoResetJson, TargetModes.FollowCurrent, fixtureNow);
+                long isoExpected = new DateTimeOffset(
+                    2026,
+                    9,
+                    20,
+                    23,
+                    8,
+                    42,
+                    TimeSpan.FromHours(8)).ToUnixTimeSeconds();
+                bool isoResetOk = isoReset.HasReliableResetTime && isoReset.ResetsAtUnix == isoExpected;
+                lines.Add("QuotaResetTimezoneConversion=" + isoResetOk);
+                success = success && isoResetOk;
+
+                string invalidResetJson = @"{""type"":""event_msg"",""payload"":{""rate_limits"":{""limit_id"":""codex"",""primary"":{""window_minutes"":300,""resets_at"":""2026-09-20 23:08:42""}}}}
+{""type"":""item.completed"",""item"":{""type"":""agent_message"",""text"":""ok""}}";
+                RunRecord invalidReset = AnalyzeFixture(invalidResetJson, TargetModes.FollowCurrent, fixtureNow);
+                bool invalidResetOk = !invalidReset.HasReliableResetTime
+                    && invalidReset.ResetTimeDiagnostic.IndexOf("带时区", StringComparison.Ordinal) >= 0;
+                lines.Add("QuotaResetMissingTimezoneSafe=" + invalidResetOk);
+                success = success && invalidResetOk;
+
+                string conflictJson = BuildAnalyzerFixtureJson(newWindowReset, "custom", "请求链路测试成功。")
+                    + "\n{\"type\":\"event_msg\",\"payload\":{\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":{\"window_minutes\":300,\"resets_at\":"
+                    + (newWindowReset + 60).ToString(CultureInfo.InvariantCulture)
+                    + "}}}}";
+                RunRecord conflict = AnalyzeFixture(conflictJson, TargetModes.FollowCurrent, fixtureNow);
+                ResetScheduleAdjustment conflictAdjustment = ResetSchedulePlanner.Evaluate(conflict, 1, fixtureNow);
+                bool conflictOk = !conflict.HasReliableResetTime
+                    && !conflictAdjustment.Applied
+                    && conflictAdjustment.Message.IndexOf("冲突", StringComparison.Ordinal) >= 0;
+                lines.Add("QuotaResetConflictSafe=" + conflictOk);
+                success = success && conflictOk;
+
+                ResetScheduleAdjustment zeroSequenceAdjustment = ResetSchedulePlanner.Evaluate(
+                    recognized,
+                    0,
+                    fixtureNow);
+                bool zeroSequenceResetOk = !zeroSequenceAdjustment.Applied
+                    && zeroSequenceAdjustment.Message == "当前未启用执行序列，计划未调整。";
+                lines.Add("QuotaResetZeroSequenceSafe=" + zeroSequenceResetOk);
+                success = success && zeroSequenceResetOk;
+
+                RunRecord pastReset = new RunRecord();
+                pastReset.Success = true;
+                pastReset.HasReliableResetTime = true;
+                pastReset.ResetsAtUnix = new DateTimeOffset(fixtureNow.AddMinutes(-1)).ToUnixTimeSeconds();
+                ResetScheduleAdjustment pastAdjustment = ResetSchedulePlanner.Evaluate(pastReset, 1, fixtureNow);
+                bool pastResetOk = !pastAdjustment.Applied
+                    && pastAdjustment.Message.IndexOf("已过去", StringComparison.Ordinal) >= 0;
+                lines.Add("QuotaResetPastTimeSafe=" + pastResetOk);
+                success = success && pastResetOk;
+
                 string unknownJson = @"{""type"":""session_meta"",""payload"":{""model_provider"":""custom""}}
 {""type"":""item.completed"",""item"":{""type"":""agent_message"",""text"":""ok""}}";
                 RunRecord unknown = AnalyzeFixture(unknownJson, TargetModes.FollowCurrent, fixtureNow);
@@ -4093,6 +4380,14 @@ namespace CodexQuotaWaker
             result.AppendLine(RouteTestPresentation.FinalModelLabel(last));
             result.AppendLine("实际链路：" + RouteTestPresentation.RouteSummary(last));
             result.AppendLine("实际 provider：" + (string.IsNullOrWhiteSpace(last.Provider) ? "未识别" : last.Provider));
+            if (last.HasReliableResetTime && !string.IsNullOrWhiteSpace(last.ResetAtLocal))
+            {
+                result.AppendLine("额度重置时间（仅用于未保存预填）：" + last.ResetAtLocal);
+            }
+            else if (!string.IsNullOrWhiteSpace(last.ResetTimeDiagnostic))
+            {
+                result.AppendLine("额度重置时间：" + last.ResetTimeDiagnostic);
+            }
             if (!string.IsNullOrWhiteSpace(last.UpstreamProvider))
             {
                 result.AppendLine("CC Switch 上游：" + last.UpstreamProvider + (string.IsNullOrWhiteSpace(last.UpstreamTarget) ? string.Empty : "（" + last.UpstreamTarget + "）"));
@@ -4184,12 +4479,21 @@ namespace CodexQuotaWaker
 
         private void UpdateTimeline(DateTime now)
         {
+            UpdateTimeline(now, config ?? new AppConfig(), false);
+        }
+
+        private void UpdateDraftTimeline(DateTime now)
+        {
+            UpdateTimeline(now, ReadForm(config != null && config.Enabled), true);
+        }
+
+        private void UpdateTimeline(DateTime now, AppConfig preview, bool draft)
+        {
             if (timelineList == null || timelineSummaryLabel == null)
             {
                 return;
             }
 
-            AppConfig preview = config ?? new AppConfig();
             List<PlannedRun> plan = SchedulePlanner.Build(preview, now, 14);
             timelineList.BeginUpdate();
             try
@@ -4224,16 +4528,20 @@ namespace CodexQuotaWaker
                 }
                 if (plan.Count == 0)
                 {
-                    timelineSummaryLabel.Text = "尚未保存可展示的计划。修改计划后点击“保存并启用”即可在此查看。";
+                    timelineSummaryLabel.Text = draft
+                        ? "尚未保存的计划预览为空。"
+                        : "尚未保存可展示的计划。修改计划后点击“保存并启用”即可在此查看。";
                 }
                 else if (plan.Count > visibleLimit)
                 {
-                    timelineSummaryLabel.Text = "当前已保存计划共 " + plan.Count + " 条；为保持清晰，仅显示前 " + visibleLimit + " 条。";
+                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "当前已保存计划共 ")
+                        + plan.Count + " 条；为保持清晰，仅显示前 " + visibleLimit + " 条。";
                 }
                 else
                 {
                     int futureCount = plan.Count(delegate(PlannedRun item) { return item.Time > now; });
-                    timelineSummaryLabel.Text = "当前已保存计划共 " + plan.Count + " 条；待执行 " + futureCount + " 条。绿色行是下一次触发。";
+                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "当前已保存计划共 ")
+                        + plan.Count + " 条；待执行 " + futureCount + " 条。绿色行是下一次触发。";
                 }
             }
             finally
@@ -4297,7 +4605,7 @@ namespace CodexQuotaWaker
             }
             extraWakeList.SelectedItem = formatted;
             UpdateSequenceSummary();
-            UpdateTimeline(DateTime.Now);
+            UpdateDraftTimeline(DateTime.Now);
         }
 
         private void RemoveExtraWake()
@@ -4306,7 +4614,7 @@ namespace CodexQuotaWaker
             {
                 extraWakeList.Items.RemoveAt(extraWakeList.SelectedIndex);
                 UpdateSequenceSummary();
-                UpdateTimeline(DateTime.Now);
+                UpdateDraftTimeline(DateTime.Now);
             }
         }
 
@@ -4323,6 +4631,7 @@ namespace CodexQuotaWaker
                 nextMinute = SequenceStartShortcut.NextMinute(DateTime.Now);
                 sequenceDatePicker.Value = nextMinute.Date;
                 sequenceTimePicker.Value = DateTime.Today.AddHours(nextMinute.Hour).AddMinutes(nextMinute.Minute);
+                UpdateDraftTimeline(DateTime.Now);
             }
             catch (ArgumentOutOfRangeException)
             {
@@ -4507,6 +4816,21 @@ namespace CodexQuotaWaker
             SetBusy(true, "正在发送真实 Codex 请求…");
             RunRecord result = await Task.Run(delegate { return BackgroundRunner.Execute("manual", false, testConfig); });
             RefreshStatus();
+            ResetScheduleAdjustment scheduleAdjustment = ResetSchedulePlanner.Evaluate(
+                result,
+                testConfig.SequenceCount,
+                DateTime.Now);
+            if (scheduleAdjustment.Applied)
+            {
+                sequenceDatePicker.Value = scheduleAdjustment.LocalStart.Date;
+                sequenceTimePicker.Value = DateTime.Today
+                    .AddHours(scheduleAdjustment.LocalStart.Hour)
+                    .AddMinutes(scheduleAdjustment.LocalStart.Minute);
+                UpdateSequenceSummary();
+                UpdateDraftTimeline(DateTime.Now);
+                sequenceSummaryLabel.Text += "\r\n" + scheduleAdjustment.Message;
+                sequenceSummaryLabel.ForeColor = Color.FromArgb(160, 100, 20);
+            }
 
             string resultMessage;
             MessageBoxIcon resultIcon;
@@ -4515,7 +4839,8 @@ namespace CodexQuotaWaker
             {
                 resultMessage = "链路未联通。\r\n\r\n"
                     + "失败点：" + (string.IsNullOrWhiteSpace(result.Error) ? "未记录" : result.Error) + "\r\n"
-                    + "下一步：" + RouteTestPresentation.FailureNextStep(result);
+                    + "下一步：" + RouteTestPresentation.FailureNextStep(result)
+                    + "\r\n\r\n" + scheduleAdjustment.Message;
                 resultIcon = MessageBoxIcon.Error;
                 busyMessage = "链路未联通：" + (string.IsNullOrWhiteSpace(result.Error) ? "请查看日志" : result.Error);
             }
@@ -4536,6 +4861,7 @@ namespace CodexQuotaWaker
                 {
                     resultMessage += "\r\n\r\n最终模型证据不足，请打开日志查看本次结构化响应。";
                 }
+                resultMessage += "\r\n\r\n" + scheduleAdjustment.Message;
                 resultIcon = MessageBoxIcon.Information;
                 busyMessage = "链路已联通。";
             }
