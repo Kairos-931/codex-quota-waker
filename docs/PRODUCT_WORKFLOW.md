@@ -9,14 +9,15 @@
 - Replaced on 2026-09-08 at user request: old task `01a070e8-07a6-77c3-b783-2a92ce597421`, latest turn completed, not running. User handles its archival. Do not dispatch further work to the old task.
 - Shared checkout: `C:\文档\GPT使用.迁移\codex-quota-waker`
 - Initialized: `2026-09-05`
-- Status: implementation complete
+- Status: initialized; current development requirement implemented and formally verified
 
 ## Active development
 
-- Requirement: none
-- Started: not active
-- Approved execution profile: none
-- Delivery: no requirement is currently in development; the developer is available for the next confirmed specification.
+- Requirement: `docs/requirements/REQ-20260922-simplify-request-route-test.md`
+- Started: `2026-09-22`
+- Approved execution profile: `gpt-5.6-luna / max`
+- Visual QA authorization: approved before development; one minimal Windows foreground check of the request-route card, estimated 3–5 minutes, without sending a real request or changing the user plan.
+- Delivery: implemented in the bound developer task; formal build and verification passed. The approved visual check was attempted but the current Computer Use surface did not expose the WinForms window, so no visual assertion is claimed.
 - Queue: empty
 
 ## Operating contract
@@ -31,6 +32,34 @@
 8. Product-impacting ambiguity returns to the requirements task; implementation details remain with the developer task.
 
 ## Latest completed development
+
+- Requirement: `docs/requirements/REQ-20260922-simplify-request-route-test.md`
+- Status: implemented and formally verified on 2026-09-22
+- Developer task: `codex://threads/01a07f70-dd43-7292-9ebb-497bc178b349`
+- Approved execution profile: `gpt-5.6-luna / max`
+- Version: `0.11.0`
+- Verification: `scripts/build.ps1` and `scripts/verify.ps1` passed; route-test self-checks for valid response status, final-model evidence, no request-model fallback, quota-field isolation, scheduler XML, and no-secret diagnostics passed. The approved visual check was attempted but native WinForms was not exposed by the active Computer Use surface; no real Codex request, plan change, route change, or git push was performed.
+
+- Requirement: `docs/requirements/REQ-20260910-password-pin-guidance.md`
+- Status: implemented and formally verified on 2026-09-22
+- Developer task: `codex://threads/01a07f70-dd43-7292-9ebb-497bc178b349`
+- Approved execution profile: `gpt-5.6-luna / max`
+- Version: `0.10.1`
+- Verification: `scripts/build.ps1` and `scripts/verify.ps1` passed; credential diagnosis, PIN guidance, secret-safety, existing route/quota, scheduler, and task registration checks passed; no real password, user plan, security policy, real Codex request, or git push was used.
+
+- Requirement: `docs/requirements/REQ-20260918-route-and-quota-verification.md`
+- Status: implemented and formally verified on 2026-09-18
+- Developer task: direct implementation exception authorized by the user in the requirements task
+- Approved execution profile: current interface model / current interface reasoning effort; user override
+- Version: `0.10.0`
+- Verification: `scripts/build.ps1` and `scripts/verify.ps1` passed; route, quota, final-model and CC Switch upstream fixtures passed; no user plan was changed.
+
+- Requirement: `docs/requirements/REQ-20260910-run-after-restart.md`
+- Status: implemented and formally verified on 2026-09-10
+- Developer task: `codex://threads/01a07f70-dd43-7292-9ebb-497bc178b349`
+- Approved execution profile: `gpt-5.6-luna / high`
+- Version: `0.9.0`
+- Verification: `scripts/build.ps1` and `scripts/verify.ps1` passed; no real password was entered, no user plan was changed, and no git push was performed.
 
 - Requirement: `docs/requirements/REQ-20260909-start-now-button.md`
 - Status: implemented and formally verified on 2026-09-09
