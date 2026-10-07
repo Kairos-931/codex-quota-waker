@@ -25,9 +25,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.16.1.0")]
-[assembly: AssemblyFileVersion("0.16.1.0")]
-[assembly: AssemblyInformationalVersion("0.16.1")]
+[assembly: AssemblyVersion("0.17.0.0")]
+[assembly: AssemblyFileVersion("0.17.0.0")]
+[assembly: AssemblyInformationalVersion("0.17.0")]
 
 namespace CodexQuotaWaker
 {
@@ -89,6 +89,20 @@ namespace CodexQuotaWaker
                         MessageBoxIcon.Error);
                 }
                 return 2;
+            }
+        }
+    }
+
+    internal static class AppVersion
+    {
+        public static string Display
+        {
+            get
+            {
+                Assembly assembly = Assembly.GetExecutingAssembly();
+                AssemblyInformationalVersionAttribute version = assembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)
+                    .Cast<AssemblyInformationalVersionAttribute>().FirstOrDefault();
+                return "v" + (version == null ? assembly.GetName().Version.ToString(3) : version.InformationalVersion);
             }
         }
     }
@@ -5173,6 +5187,11 @@ namespace CodexQuotaWaker
                 lines.Add("TimelineRenderingEvidence=" + timelineRenderingEvidence);
                 lines.Add("TimelineRendering=" + timelineRenderingOk);
                 success = success && timelineRenderingOk;
+                string visibleVersionEvidence;
+                bool visibleVersionOk = MainForm.VerifyVisibleVersion(out visibleVersionEvidence);
+                lines.Add("VisibleAppVersionEvidence=" + visibleVersionEvidence);
+                lines.Add("VisibleAppVersion=" + visibleVersionOk);
+                success = success && visibleVersionOk;
                 string timelineContinuityEvidence;
                 bool timelineContinuityOk = TimelineContinuityChecks.Verify(out timelineContinuityEvidence);
                 lines.Add("TimelineContinuityEvidence=" + timelineContinuityEvidence);
@@ -5440,6 +5459,8 @@ namespace CodexQuotaWaker
         private readonly TableLayoutPanel pageRoot;
         private readonly TableLayoutPanel mainGrid;
         private readonly Panel heroCard;
+        private readonly Label brandVersionLabel;
+        private readonly Label brandSubtitleLabel;
         private readonly FlowLayoutPanel leftStack;
         private readonly FlowLayoutPanel rightStack;
         private readonly Label nextRunLabel;
@@ -5506,7 +5527,7 @@ namespace CodexQuotaWaker
 
         public MainForm()
         {
-            Text = "Codex 额度唤醒器";
+            Text = "Codex 额度唤醒器  " + AppVersion.Display;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(760, 620);
             Size = new Size(1180, 940);
@@ -5538,7 +5559,14 @@ namespace CodexQuotaWaker
             brand.Controls.Add(mark);
             FlowLayoutPanel brandText = NewFlow(true);
             brandText.Controls.Add(new Label { Text = "额度唤醒器", AutoSize = true, Font = new Font("Microsoft YaHei UI", 15F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0) });
-            brandText.Controls.Add(new Label { Text = "安排好时间，剩下的交给电脑。", AutoSize = true, Font = new Font("Microsoft YaHei UI", 9F), ForeColor = Muted, Margin = new Padding(0, 2, 0, 0) });
+            FlowLayoutPanel brandCaption = NewFlow(false);
+            brandCaption.WrapContents = false;
+            brandSubtitleLabel = new Label { Text = "安排好时间，剩下的交给电脑。", AutoSize = true, Font = new Font("Microsoft YaHei UI", 9F), ForeColor = Muted, Margin = new Padding(0, 2, 0, 0) };
+            brandVersionLabel = new Label { Text = AppVersion.Display, AutoSize = true, Font = brandSubtitleLabel.Font,
+                ForeColor = Muted, Margin = new Padding(10, 2, 0, 0), AccessibleName = "软件版本" };
+            brandCaption.Controls.Add(brandSubtitleLabel);
+            brandCaption.Controls.Add(brandVersionLabel);
+            brandText.Controls.Add(brandCaption);
             brand.Controls.Add(brandText);
             pageRoot.Controls.Add(brand, 0, 0);
 
@@ -6623,6 +6651,46 @@ namespace CodexQuotaWaker
                 evidence = "exception=" + ex.GetType().Name + ":" + ex.Message;
                 return false;
             }
+        }
+
+        internal static bool VerifyVisibleVersion(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            string expected = "v" + FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+            foreach (int width in new[] { 1420, 760 })
+            foreach (float scale in new[] { 1F, 1.5F })
+            using (MainForm form = new MainForm())
+            {
+                if (scale != 1F)
+                {
+                    form.Scale(new SizeF(scale, scale));
+                    form.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                    // Simulate the native font metrics as well as the scaled bounds.
+                    form.brandVersionLabel.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                    form.brandSubtitleLabel.Font = form.brandVersionLabel.Font;
+                }
+                form.ClientSize = new Size(width, 880);
+                IntPtr handle = form.Handle;
+                EnsureControlHandles(form);
+                typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { EventArgs.Empty });
+                form.LayoutResponsive();
+                PerformLayoutTree(form);
+                form.viewport.AutoScrollPosition = Point.Empty;
+                Rectangle versionBounds = BoundsInAncestor(form.brandVersionLabel, form.viewport);
+                Rectangle subtitleBounds = BoundsInAncestor(form.brandSubtitleLabel, form.viewport);
+                Rectangle heroBounds = BoundsInAncestor(form.heroCard, form.viewport);
+                Size text = TextRenderer.MeasureText(form.brandVersionLabel.Text, form.brandVersionLabel.Font);
+                bool matches = form.brandVersionLabel.Text == expected && form.Text.EndsWith(expected, StringComparison.Ordinal);
+                bool readable = form.brandVersionLabel.AutoSize && form.brandVersionLabel.Width >= text.Width
+                    && form.brandVersionLabel.Height >= text.Height && form.viewport.ClientRectangle.Contains(versionBounds)
+                    && form.brandVersionLabel.Parent.ClientRectangle.Contains(form.brandVersionLabel.Bounds)
+                    && !versionBounds.IntersectsWith(subtitleBounds) && versionBounds.Bottom <= heroBounds.Top;
+                checks.Add(width + "/" + scale + ":metadata=" + matches + ",firstScreenReadable=" + readable + ",version=" + FormatBounds(versionBounds));
+                ok = ok && matches && readable;
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
         }
 
         internal static bool VerifyTimelineRendering(out string evidence)

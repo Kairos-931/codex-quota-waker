@@ -1,5 +1,11 @@
 # Product workflow
 
+## 2026-10-08 VERSION-001
+
+- 用户直接要求打开软件即可在合适位置看到版本号，属简单可逆的展示变更；权威需求 `docs/requirements/REQ-20261008-visible-app-version.md`，confirmed。
+- 沿用 `gpt-6.1-sol / medium`、当前开发聊天 `01a10130-e18a-7860-8690-0ed3fc4a1593`，单聊天；代码/隐藏布局验证，不占用桌面，不改计划/真实请求/启动入口，不 push。
+- 2026-10-08 已完成实现和原路径交付，`implementation_completed / awaiting_acceptance`：0.17.0 主窗口品牌区与标题显示当前程序集版本；宽窄窗口 100%/150% 隐藏布局及完整 build/verify/diff 检查通过。原 EXE 与计划引用后台副本版本和哈希一致；配置、任务定义、执行历史及最近结果哈希不变。实机视觉未验收；无活动工作命令，执行槽释放。详见权威需求交付记录。
+
 ## 2026-10-07 TIMELINE-001 执行
 
 - 权威需求：`docs/requirements/REQ-20261007-timeline-execution-status.md`，confirmed。用户要求真实执行状态，产品已向当前开发聊天交付；批准配置 `gpt-6.1-sol / medium`，单聊天、无子代理或工作树、非视觉验证。
