@@ -1,5 +1,20 @@
 # Product workflow
 
+## 2026-10-07 结果弹窗优化执行
+
+- 用户最新执行档位覆盖：`gpt-6.1-sol / medium`，已成功向原开发聊天发送设置；本轮替代此前Luna/max，范围及验收不变。
+
+- 当前需求：`docs/requirements/REQ-20261007-test-result-dialog.md`，用户已明确要求执行；执行档位 gpt-6.1-sol/medium、单聊天、纯代码与隐藏布局验证，无桌面控制。
+- 开发：01a10130-e18a-7860-8690-0ed3fc4a1593，发送前上轮completed/无运行工作，需求发送成功。固定原EXE与启动入口。
+- 本项只优化测试结果弹窗；WAKE-001与其他issue继续待办。
+- 2026-10-07 开发已完成，待用户验收：`0.15.2` 已更新固定 `dist/CodexQuotaWaker.exe`。build/verify/diff 检查通过，结果弹窗布局与导航数据不变检查通过；实机视觉和真实请求未验收。详见需求中的开发交付记录。无活动工作进程/命令，执行槽释放。
+
+## 2026-10-04 TEST-001 开发记录
+
+- 需求：`docs/requirements/REQ-20261004-independent-link-test.md`。用户明确“继续工作”，沿用 Luna/max 单聊天；已交付版本 `0.15.1`。
+- 发送前确认 MODEL-001 已完成、开发 01a10130-e18a-7860-8690-0ed3fc4a1593 idle；需求已成功送达。
+- 本轮只拆分连接测试与计划校验，其余 issue 待办；固定原 EXE 与启动入口。
+
 - Project: `Codex 额度唤醒器`
 - Requirements task title: `【Codex 额度唤醒器】需求`
 - Requirements task: `codex://threads/01a07f60-ce49-7091-9d5c-9e9617dcdf87`
@@ -9,18 +24,47 @@
 - Replaced on 2026-09-08 at user request: old task `01a070e8-07a6-77c3-b783-2a92ce597421`, latest turn completed, not running. User handles its archival. Do not dispatch further work to the old task.
 - Shared checkout: `C:\文档\GPT使用.迁移\codex-quota-waker`
 - Initialized: `2026-09-05`
-- Status: initialized; current development requirement implemented and formally verified
+- Status: initialized; MODEL-001 and TEST-001 were delivered on 2026-10-04; UI-003 result dialog was delivered on 2026-10-07 and awaits acceptance; no requirement is currently executing.
 
-## Active development
+## Latest development
 
-- Requirement: none
-- Started: `2026-09-22`
-- Approved execution profile: `gpt-5.6-luna / max` (confirmation option `0`)
-- Visual QA: not required or authorized; deterministic build, self-check, and time-boundary tests only.
-- Delivery: completed in the bound developer task; no real Codex request, route change, plan installation, desktop control, or git push was performed.
-- Queue: empty
+- 2026-10-04 完成 TEST-001：`docs/requirements/REQ-20261004-independent-link-test.md`。修复根因是手动测试复用计划全量校验，导致未填完的计划阻断请求测试。
+- Developer: `codex://threads/01a10130-e18a-7860-8690-0ed3fc4a1593`；批准配置 `gpt-6-luna / max`，单聊天串行，不使用子代理或桌面控制。
+- Release: `0.15.1`; canonical output `dist/CodexQuotaWaker.exe` (`ProductVersion=0.15.1`, `FileVersion=0.15.1.0`, 161792 bytes, SHA-256 `840E1035FA4D35A5EA8B8E24318A2CA2A46E2FC5E20B5E9DC2AE32AA31CF3560`)；固定原启动入口。
+- Verification: `scripts/build.ps1`, `scripts/verify.ps1`, and `git diff --check` passed; manual-test isolation, full plan validation, reset-prefill gating and draft protection checks passed; task registration and full verification both passed.
+- Coordination: completion evidence including root cause, tests, release status and the end-to-end limitation was sent successfully to the product task `额度唤醒器-产品` (`01a1012e-b555-7490-a340-5264a4da3c7b`).
+- Boundaries: no real Codex request, user plan/config change, desktop control, or `git push`; STATE-001 remains untouched. The verification script's dedicated integration task was removed; no active worker or command remains.
+
+## Previous delivery: MODEL-001 (0.15.0)
+
+- 2026-10-04 完成 MODEL-001：`docs/requirements/REQ-20261004-refresh-request-model-catalog.md`。
+- Developer: `codex://threads/01a10130-e18a-7860-8690-0ed3fc4a1593`；批准配置 `gpt-6-luna / max`，单聊天串行，不使用子代理或新工作树。
+- Release: `0.15.0`; canonical output `dist/CodexQuotaWaker.exe` (`ProductVersion=0.15.0`, `FileVersion=0.15.0.0`, 157184 bytes).
+- Verification: `scripts/build.ps1`, `scripts/verify.ps1`, and `git diff --check` passed; model filtering/deduplication, safe cache, fallback, timeout/failure, request snapshot and selection-preservation checks passed; task registration and full verification both passed.
+- Coordination: completion evidence was sent successfully to the product task `额度唤醒器-产品` (`01a1012e-b555-7490-a340-5264a4da3c7b`).
+- Boundaries: no real Codex request, user plan/config change, desktop control, or `git push`; TEST-001 and STATE-001 were then untouched. No active worker or command remains.
+
+## Previous delivered requirement: flexible plan input order (0.14.1)
+
+- Requirement: `docs/requirements/REQ-20261004-flexible-plan-input-order.md`; implementation and formal path delivery completed.
+- The original `dist/CodexQuotaWaker.exe` was updated after PID 22944 exited naturally. Verified `ProductVersion=0.14.1`, `FileVersion=0.14.1.0`; `FlexiblePlanInputOrder=True`, `TaskRegistration=PASS`, `Verification=PASS`.
+- Hidden WinForms coverage included blank/invalid/zero sequence input, retained start values, “现在”, invalid save rejection and zero sequence plus extra wake. No desktop control or real Codex request was used.
+
+## Previous feature release: GPT-6 request models
+
+- Requirement: `docs/requirements/REQ-20261003-gpt6-request-models.md`; version `0.14.0` was installed at the official path after PID 33536 exited naturally.
+- Model behavior: `gpt-6-luna` is the constructor and empty-value default; only an unconfirmed legacy `gpt-5.6-luna` is migrated in the UI draft. A persisted confirmation flag preserves a deliberately selected `gpt-5.6-luna`; custom values remain supported.
+- Model-catalog evidence: installed `codex-cli 0.160.0`; read-only `codex debug models` returned `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` with `visibility=list` and `supported_in_api=true`. No model request was sent.
+- The earlier UI v2 native date/time border visual comparison remains unverified. No desktop control was used for the model update.
+
+## Superseded UI iteration
+
+- `docs/requirements/REQ-20261003-modern-ui.md` records the earlier visual direction that the user did not accept. The v2 requirement and demo supersede it; preserve its history, but do not treat its visual review as acceptance of v2.
+- The earlier iteration's notes about desktop inspection are historical and do not authorize desktop control for the v2 work.
 
 ## Operating contract
+
+- 产品优化待办：`docs/requirements/ISSUES.md`。用户要求当前输入顺序修复完成后逐项优化；待办未批准开发，不进入当前实现或已批准开发队列。
 
 1. Product discussion, specifications, acceptance criteria, and demos live in the requirements task.
 2. Confirmed production implementation lives in the developer task.

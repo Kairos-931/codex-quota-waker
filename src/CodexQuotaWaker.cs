@@ -1,9 +1,11 @@
 using System;
+using System.Collections;
 using System.ComponentModel;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Eventing.Reader;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -22,9 +24,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.12.0.0")]
-[assembly: AssemblyFileVersion("0.12.0.0")]
-[assembly: AssemblyInformationalVersion("0.12.0")]
+[assembly: AssemblyVersion("0.15.2.0")]
+[assembly: AssemblyFileVersion("0.15.2.0")]
+[assembly: AssemblyInformationalVersion("0.15.2")]
 
 namespace CodexQuotaWaker
 {
@@ -46,6 +48,8 @@ namespace CodexQuotaWaker
                 if (args.Length > 0 && string.Equals(args[0], "--self-check", StringComparison.OrdinalIgnoreCase))
                 {
                     string reportPath = args.Length > 1 ? args[1] : Path.Combine(AppPaths.BaseDirectory, "self-check.txt");
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
                     return SelfCheck.Run(reportPath);
                 }
 
@@ -95,6 +99,7 @@ namespace CodexQuotaWaker
         public static readonly string ConfigPath = Path.Combine(BaseDirectory, "config.json");
         public static readonly string LastRunPath = Path.Combine(BaseDirectory, "last-run.json");
         public static readonly string LogPath = Path.Combine(BaseDirectory, "activity.log");
+        public static readonly string ModelCatalogPath = Path.Combine(BaseDirectory, "model-catalog.json");
         public static readonly string InstalledExePath = Path.Combine(BaseDirectory, "CodexQuotaWaker.exe");
 
         public static void EnsureDirectories()
@@ -124,10 +129,32 @@ namespace CodexQuotaWaker
     }
     internal sealed class AppConfig
     {
+        public const string DefaultRequestModel = "gpt-6-luna";
+        public const string LegacyDefaultRequestModel = "gpt-5.6-luna";
+
+        public static string[] ListedRequestModels()
+        {
+            return new[] { "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra" };
+        }
+
+        public static bool MigrateLegacyDefaultModelToDraft(AppConfig config)
+        {
+            if (config == null || config.RequestModelSelectionConfirmed || !string.Equals(
+                (config.Model ?? string.Empty).Trim(),
+                LegacyDefaultRequestModel,
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            config.Model = DefaultRequestModel;
+            return true;
+        }
+
         // Kept only so older JSON files can still be read. The unified scheduler
         // intentionally never uses the legacy daily-time or mode fields.
         public List<string> Times { get; set; }
         public string Model { get; set; }
+        public bool RequestModelSelectionConfirmed { get; set; }
         public string TargetMode { get; set; }
         public string Prompt { get; set; }
         public int RetryCount { get; set; }
@@ -144,7 +171,7 @@ namespace CodexQuotaWaker
         public AppConfig()
         {
             Times = new List<string>();
-            Model = "gpt-5.6-luna";
+            Model = DefaultRequestModel;
             TargetMode = TargetModes.Official;
             Prompt = "只回复：请求链路测试成功。不要调用工具。";
             RetryCount = 3;
@@ -181,7 +208,7 @@ namespace CodexQuotaWaker
             config.FiniteSequenceEnabled = true;
             if (string.IsNullOrWhiteSpace(config.Model))
             {
-                config.Model = "gpt-5.6-luna";
+                config.Model = DefaultRequestModel;
             }
             config.TargetMode = TargetModes.Normalize(config.TargetMode);
             if (string.IsNullOrWhiteSpace(config.Prompt))
@@ -576,17 +603,400 @@ namespace CodexQuotaWaker
         }
     }
 
-    internal static class SequenceStartShortcut
+    internal sealed class RequestModelCatalogEntry
     {
-        public static bool IsEnabled(string sequenceCountText)
+        public string Slug { get; set; }
+        public string DisplayName { get; set; }
+    }
+
+    internal sealed class RequestModelCatalogSnapshot
+    {
+        public string RefreshedAtUtc { get; set; }
+        public List<RequestModelCatalogEntry> Models { get; set; }
+
+        public RequestModelCatalogSnapshot()
         {
-            int count;
+            RefreshedAtUtc = string.Empty;
+            Models = new List<RequestModelCatalogEntry>();
+        }
+    }
+
+    internal sealed class RequestModelCatalogRefreshResult
+    {
+        public bool Success { get; set; }
+        public bool TimedOut { get; set; }
+        public bool CacheSaved { get; set; }
+        public RequestModelCatalogSnapshot Snapshot { get; set; }
+    }
+
+    internal static class RequestModelCatalogService
+    {
+        public const int TimeoutMilliseconds = 10000;
+        private const int MaxModels = 256;
+        private static readonly Regex SlugPattern = new Regex(
+            "\\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\z",
+            RegexOptions.CultureInvariant);
+
+        public static RequestModelCatalogSnapshot CreateBuiltIn()
+        {
+            RequestModelCatalogSnapshot snapshot = new RequestModelCatalogSnapshot();
+            string[] slugs = AppConfig.ListedRequestModels();
+            foreach (string slug in slugs)
+            {
+                snapshot.Models.Add(new RequestModelCatalogEntry
+                {
+                    Slug = slug,
+                    DisplayName = slug
+                });
+            }
+            return snapshot;
+        }
+
+        public static RequestModelCatalogSnapshot LoadOrFallback(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    RequestModelCatalogSnapshot cached = ParseCache(File.ReadAllText(path));
+                    if (cached != null)
+                    {
+                        return cached;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return CreateBuiltIn();
+        }
+
+        public static RequestModelCatalogSnapshot ParseCacheOrFallback(string json)
+        {
+            RequestModelCatalogSnapshot cached = ParseCache(json);
+            return cached ?? CreateBuiltIn();
+        }
+
+        public static RequestModelCatalogSnapshot ParseCache(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            try
+            {
+                IDictionary<string, object> root = DeserializeDictionary(json);
+                if (root == null)
+                {
+                    return null;
+                }
+
+                string refreshedAt = GetString(root, "RefreshedAtUtc");
+                DateTimeOffset parsedTime;
+                if (!DateTimeOffset.TryParse(
+                    refreshedAt,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out parsedTime))
+                {
+                    return null;
+                }
+
+                object rawModels;
+                if (!root.TryGetValue("Models", out rawModels))
+                {
+                    return null;
+                }
+                IEnumerable modelArray = rawModels as IEnumerable;
+                if (modelArray == null || rawModels is string)
+                {
+                    return null;
+                }
+
+                List<RequestModelCatalogEntry> entries = new List<RequestModelCatalogEntry>();
+                foreach (object rawEntry in modelArray)
+                {
+                    IDictionary<string, object> entry = rawEntry as IDictionary<string, object>;
+                    if (entry == null)
+                    {
+                        continue;
+                    }
+                    entries.Add(new RequestModelCatalogEntry
+                    {
+                        Slug = GetString(entry, "Slug"),
+                        DisplayName = GetString(entry, "DisplayName")
+                    });
+                }
+
+                List<RequestModelCatalogEntry> normalized = NormalizeEntries(entries);
+                if (normalized.Count == 0)
+                {
+                    return null;
+                }
+
+                return new RequestModelCatalogSnapshot
+                {
+                    RefreshedAtUtc = parsedTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                    Models = normalized
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static RequestModelCatalogRefreshResult Evaluate(ProcessResult process)
+        {
+            RequestModelCatalogRefreshResult result = new RequestModelCatalogRefreshResult();
+            if (process == null)
+            {
+                return result;
+            }
+            if (process.TimedOut)
+            {
+                result.TimedOut = true;
+                return result;
+            }
+            if (process.ExitCode != 0)
+            {
+                return result;
+            }
+
+            RequestModelCatalogSnapshot parsed = ParseCliCatalog(process.StandardOutput);
+            if (parsed == null)
+            {
+                return result;
+            }
+
+            parsed.RefreshedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            result.Success = true;
+            result.Snapshot = parsed;
+            return result;
+        }
+
+        public static RequestModelCatalogRefreshResult Refresh(string codexPath, string cachePath)
+        {
+            if (string.IsNullOrWhiteSpace(codexPath) || !File.Exists(codexPath))
+            {
+                return new RequestModelCatalogRefreshResult();
+            }
+
+            try
+            {
+                ProcessResult process = ProcessRunner.Run(
+                    codexPath,
+                    "debug models",
+                    AppPaths.BaseDirectory,
+                    TimeoutMilliseconds);
+                RequestModelCatalogRefreshResult result = Evaluate(process);
+                if (!result.Success)
+                {
+                    return result;
+                }
+                result.CacheSaved = TrySaveCache(cachePath, result.Snapshot);
+                return result;
+            }
+            catch
+            {
+                return new RequestModelCatalogRefreshResult();
+            }
+        }
+
+        public static RequestModelCatalogSnapshot ParseCliCatalog(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            try
+            {
+                IDictionary<string, object> root = DeserializeDictionary(json);
+                if (root == null)
+                {
+                    return null;
+                }
+
+                object rawModels;
+                if (!root.TryGetValue("models", out rawModels))
+                {
+                    return null;
+                }
+                IEnumerable modelArray = rawModels as IEnumerable;
+                if (modelArray == null || rawModels is string)
+                {
+                    return null;
+                }
+
+                List<RequestModelCatalogEntry> entries = new List<RequestModelCatalogEntry>();
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (object rawEntry in modelArray)
+                {
+                    IDictionary<string, object> entry = rawEntry as IDictionary<string, object>;
+                    if (entry == null
+                        || !string.Equals(GetString(entry, "visibility"), "list", StringComparison.OrdinalIgnoreCase)
+                        || !GetBoolean(entry, "supported_in_api"))
+                    {
+                        continue;
+                    }
+
+                    string slug = (GetString(entry, "slug") ?? string.Empty).Trim();
+                    if (!IsSafeSlug(slug) || !seen.Add(slug))
+                    {
+                        continue;
+                    }
+
+                    entries.Add(new RequestModelCatalogEntry
+                    {
+                        Slug = slug,
+                        DisplayName = NormalizeDisplayName(GetString(entry, "display_name"), slug)
+                    });
+                    if (entries.Count >= MaxModels)
+                    {
+                        break;
+                    }
+                }
+
+                if (entries.Count == 0)
+                {
+                    return null;
+                }
+                return new RequestModelCatalogSnapshot { Models = entries };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static string SerializeCache(RequestModelCatalogSnapshot snapshot)
+        {
+            if (snapshot == null)
+            {
+                return string.Empty;
+            }
+
+            RequestModelCatalogSnapshot safe = new RequestModelCatalogSnapshot
+            {
+                RefreshedAtUtc = snapshot.RefreshedAtUtc ?? string.Empty,
+                Models = NormalizeEntries(snapshot.Models)
+            };
+            return CreateSerializer().Serialize(safe);
+        }
+
+        public static bool TrySaveCache(string path, RequestModelCatalogSnapshot snapshot)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || snapshot == null || snapshot.Models == null || snapshot.Models.Count == 0)
+                {
+                    return false;
+                }
+                AppPaths.EnsureDirectories();
+                File.WriteAllText(path, SerializeCache(snapshot), new UTF8Encoding(false));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static IDictionary<string, object> DeserializeDictionary(string json)
+        {
+            JavaScriptSerializer serializer = CreateSerializer();
+            return serializer.DeserializeObject(json) as IDictionary<string, object>;
+        }
+
+        private static JavaScriptSerializer CreateSerializer()
+        {
+            return new JavaScriptSerializer
+            {
+                MaxJsonLength = 8 * 1024 * 1024,
+                RecursionLimit = 100
+            };
+        }
+
+        private static List<RequestModelCatalogEntry> NormalizeEntries(IEnumerable<RequestModelCatalogEntry> entries)
+        {
+            List<RequestModelCatalogEntry> normalized = new List<RequestModelCatalogEntry>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (entries == null)
+            {
+                return normalized;
+            }
+
+            foreach (RequestModelCatalogEntry entry in entries)
+            {
+                string slug = entry == null ? string.Empty : (entry.Slug ?? string.Empty).Trim();
+                if (!IsSafeSlug(slug) || !seen.Add(slug))
+                {
+                    continue;
+                }
+                normalized.Add(new RequestModelCatalogEntry
+                {
+                    Slug = slug,
+                    DisplayName = NormalizeDisplayName(entry.DisplayName, slug)
+                });
+                if (normalized.Count >= MaxModels)
+                {
+                    break;
+                }
+            }
+            return normalized;
+        }
+
+        private static bool IsSafeSlug(string slug)
+        {
+            return !string.IsNullOrWhiteSpace(slug) && SlugPattern.IsMatch(slug);
+        }
+
+        private static string NormalizeDisplayName(string value, string slug)
+        {
+            string name = (value ?? string.Empty).Trim();
+            if (name.Length == 0 || name.Length > 100 || name.Any(char.IsControl))
+            {
+                return slug;
+            }
+            return name;
+        }
+
+        private static string GetString(IDictionary<string, object> values, string key)
+        {
+            object value;
+            return values != null && values.TryGetValue(key, out value) ? value as string : null;
+        }
+
+        private static bool GetBoolean(IDictionary<string, object> values, string key)
+        {
+            object value;
+            return values != null
+                && values.TryGetValue(key, out value)
+                && value is bool
+                && (bool)value;
+        }
+    }
+
+    internal static class SequenceCountInput
+    {
+        public static bool TryParse(string text, out int count)
+        {
             return int.TryParse(
-                (sequenceCountText ?? string.Empty).Trim(),
+                (text ?? string.Empty).Trim(),
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
                 out count)
-                && count > 0;
+                && count >= 0;
+        }
+    }
+
+    internal static class SequenceStartShortcut
+    {
+        public static bool IsEnabled()
+        {
+            return true;
         }
 
         public static DateTime NextMinute(DateTime now)
@@ -2315,6 +2725,301 @@ namespace CodexQuotaWaker
         }
     }
 
+    internal sealed class TestResultDialog : Form
+    {
+        private readonly Panel viewport;
+        private readonly Panel footer;
+        private readonly List<Control> rows = new List<Control>();
+        private readonly Label headline;
+        private readonly Label model;
+        private readonly Label catalog;
+        private readonly TextBox details;
+        private readonly Button detailsButton;
+        private readonly Button planButton;
+        private readonly Button closeButton;
+        private readonly Button logButton;
+        private readonly bool planApplied;
+        private bool detailsExpanded;
+        private bool layingOut;
+        private bool hiddenVerification;
+
+        protected override bool ShowWithoutActivation { get { return hiddenVerification || base.ShowWithoutActivation; } }
+
+        public TestResultDialog(RunRecord record, ResetScheduleAdjustment adjustment, string catalogFeedback, Action openLog)
+        {
+            record = record ?? new RunRecord();
+            adjustment = adjustment ?? new ResetScheduleAdjustment();
+            planApplied = adjustment.Applied;
+            Text = "测试请求链路";
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.Font;
+            BackColor = Color.FromArgb(248, 248, 252);
+            ForeColor = Color.FromArgb(42, 44, 52);
+            StartPosition = FormStartPosition.CenterParent;
+            MinimumSize = new Size(380, 400);
+            Size area = Screen.FromControl(this).WorkingArea.Size;
+            ClientSize = new Size(Math.Min(620, Math.Max(360, area.Width - 80)), Math.Min(620, Math.Max(360, area.Height - 100)));
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+            footer = new Panel { Dock = DockStyle.Bottom, Height = 62, BackColor = Color.White };
+            Controls.Add(viewport);
+            Controls.Add(footer);
+            headline = AddText(record.Success ? "请求成功" : "请求失败", 20F);
+            headline.ForeColor = record.Success ? Color.FromArgb(33, 126, 86) : Color.FromArgb(178, 54, 66);
+            AddText(FormatTime(record), 9F).ForeColor = Color.FromArgb(104, 108, 120);
+            model = AddText(string.IsNullOrWhiteSpace(record.FinalModel)
+                ? "未确认实际响应模型"
+                : "最终模型：" + record.FinalModel.Trim(), 12F);
+            if (record.Success && string.IsNullOrWhiteSpace(record.FinalModel))
+                AddText("已收到有效回复，本次请求成功。模型信息未被链路返回。", 9F);
+            if (!record.Success)
+            {
+                AddText("失败原因", 10F);
+                AddScrollable(string.IsNullOrWhiteSpace(record.Error) ? "未记录具体原因，请查看日志。" : record.Error, 110);
+                AddText("下一步：" + RouteTestPresentation.FailureNextStep(record), 10F);
+            }
+            AddText(planApplied ? "计划已预填 · 尚未保存" : "计划预填", 10F);
+            if (planApplied)
+            {
+                Label start = AddText(adjustment.LocalStart.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture), 16F);
+                start.ForeColor = Color.FromArgb(103, 73, 184);
+                AddText("首次执行时间已填入计划草稿。查看后点击“保存并启用”才会生效。", 9F);
+            }
+            else
+                AddText(string.IsNullOrWhiteSpace(adjustment.Message) ? "本次未调整计划。" : adjustment.Message, 9F);
+            catalog = AddText(catalogFeedback ?? "模型列表正在刷新，稍后会更新候选。", 9F);
+            catalog.ForeColor = Color.FromArgb(104, 108, 120);
+            detailsButton = new Button { Text = "查看技术详情", FlatStyle = FlatStyle.Flat, TabIndex = 0 };
+            detailsButton.FlatAppearance.BorderSize = 0;
+            rows.Add(detailsButton);
+            viewport.Controls.Add(detailsButton);
+            details = AddScrollable(BuildDetails(record), 180);
+            details.Visible = false;
+            detailsButton.Click += delegate { ToggleDetails(); };
+            closeButton = NewButton("关闭", 110);
+            closeButton.DialogResult = DialogResult.OK;
+            closeButton.BackColor = Color.FromArgb(103, 73, 184);
+            closeButton.ForeColor = Color.White;
+            planButton = NewButton("查看计划", 110);
+            planButton.Visible = planApplied;
+            planButton.DialogResult = DialogResult.Yes;
+            logButton = NewButton("打开日志", 100);
+            logButton.Click += delegate { if (openLog != null) openLog(); };
+            AcceptButton = closeButton;
+            CancelButton = closeButton;
+            viewport.SizeChanged += delegate { LayoutContent(); };
+            footer.SizeChanged += delegate { LayoutContent(); };
+            LayoutContent();
+        }
+
+        private Label AddText(string text, float size)
+        {
+            Label label = new Label { Text = text, Font = new Font("Microsoft YaHei UI", size), AutoSize = false, UseCompatibleTextRendering = false };
+            rows.Add(label);
+            viewport.Controls.Add(label);
+            return label;
+        }
+
+        private TextBox AddScrollable(string text, int height)
+        {
+            TextBox box = new TextBox { Text = text, Multiline = true, ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical, WordWrap = true, BorderStyle = BorderStyle.None,
+                BackColor = Color.White, Tag = height };
+            rows.Add(box);
+            viewport.Controls.Add(box);
+            return box;
+        }
+
+        private Button NewButton(string text, int width)
+        {
+            Button button = new Button { Text = text, FlatStyle = FlatStyle.Flat, Tag = width, TabIndex = footer.Controls.Count };
+            button.FlatAppearance.BorderColor = Color.FromArgb(219, 216, 228);
+            footer.Controls.Add(button);
+            return button;
+        }
+
+        private void ToggleDetails()
+        {
+            detailsExpanded = !detailsExpanded;
+            details.Visible = detailsExpanded;
+            detailsButton.Text = detailsExpanded ? "收起技术详情" : "查看技术详情";
+            LayoutContent();
+            ScrollRowIntoView(detailsExpanded ? (Control)details : detailsButton);
+        }
+
+        private void ScrollRowIntoView(Control row)
+        {
+            int top = row.Top - viewport.AutoScrollPosition.Y;
+            viewport.AutoScrollPosition = new Point(0, Math.Max(0, top - (int)(24 * Font.Size / 9F)));
+        }
+
+        public void UpdateCatalogFeedback(string text)
+        {
+            if (IsDisposed || Disposing) return;
+            catalog.Text = text ?? string.Empty;
+            LayoutContent();
+        }
+
+        private void LayoutContent()
+        {
+            if (layingOut || viewport == null || closeButton == null) return;
+            layingOut = true;
+            try
+            {
+                float scale = Font.Size / 9F;
+                int padding = (int)(24 * scale);
+                int gap = (int)(12 * scale);
+                int width = Math.Max(100, viewport.ClientSize.Width - padding * 2 - SystemInformation.VerticalScrollBarWidth);
+                int y = padding;
+                Point scroll = viewport.AutoScrollPosition;
+                foreach (Control control in rows)
+                {
+                    if (control == details && !detailsExpanded) continue;
+                    int height;
+                    Label label = control as Label;
+                    if (label != null)
+                        height = Math.Max(label.Font.Height + 4, TextRenderer.MeasureText(label.Text, label.Font,
+                            new Size(width, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl).Height + 4);
+                    else if (control is TextBox)
+                        height = (int)((int)control.Tag * scale);
+                    else
+                        height = (int)(36 * scale);
+                    control.Bounds = new Rectangle(padding + scroll.X, y + scroll.Y, width, height);
+                    y += height + gap;
+                }
+                viewport.AutoScrollMinSize = new Size(0, y + padding);
+                footer.Height = (int)(62 * scale);
+                int buttonHeight = (int)(36 * scale);
+                int buttonGap = (int)(8 * scale);
+                int x = footer.ClientSize.Width - (int)(16 * scale);
+                foreach (Button button in new[] { closeButton, planButton, logButton })
+                {
+                    if (button == planButton && !planApplied) continue;
+                    int buttonWidth = (int)((int)button.Tag * scale);
+                    x -= buttonWidth;
+                    button.Bounds = new Rectangle(x, (footer.Height - buttonHeight) / 2, buttonWidth, buttonHeight);
+                    x -= buttonGap;
+                }
+            }
+            finally { layingOut = false; }
+        }
+
+        internal static string BuildDetails(RunRecord record)
+        {
+            List<string> lines = new List<string>();
+            AddUnique(lines, "实际链路", RouteTestPresentation.RouteSummary(record));
+            AddUnique(lines, "provider", record.Provider);
+            AddUnique(lines, "实际上游", record.UpstreamProvider);
+            AddUnique(lines, "目标", record.UpstreamTarget);
+            AddUnique(lines, "链路证据", record.UpstreamEvidence);
+            AddUnique(lines, "远端诊断", record.RemoteError);
+            AddUnique(lines, "重置时间说明", record.ResetTimeDiagnostic);
+            lines.Add("退出码：" + record.ExitCode + "；尝试次数：" + record.AttemptCount);
+            return string.Join("\r\n", lines);
+        }
+
+        private static void AddUnique(List<string> lines, string label, string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            if (value.Length == 0 || lines.Any(delegate(string line) { return line.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0; })) return;
+            lines.Add(label + "：" + value);
+        }
+
+        private static string FormatTime(RunRecord record)
+        {
+            DateTimeOffset time;
+            string raw = string.IsNullOrWhiteSpace(record.FinishedAt) ? record.StartedAt : record.FinishedAt;
+            return DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.None, out time)
+                ? "完成时间：" + time.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                : "完成时间未记录";
+        }
+
+        internal static bool Verify(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            foreach (bool success in new[] { true, false })
+            foreach (int width in new[] { 620, 380 })
+            foreach (float scale in new[] { 1F, 1.5F })
+            {
+                RunRecord record = new RunRecord { Success = success, FinalModel = success && width == 620 ? "gpt-6.1-sol" : "",
+                    FinishedAt = "2026-10-07T10:00:00+08:00", Provider = "openai", UpstreamProvider = "openai",
+                    RouteSummary = "CC Switch → openai", Error = string.Concat(Enumerable.Repeat("网络错误，连接超时。", 100)),
+                    UpstreamEvidence = string.Concat(Enumerable.Repeat("脱敏链路信息。", 100)) };
+                ResetScheduleAdjustment adjustment = new ResetScheduleAdjustment { Applied = success,
+                    LocalStart = new DateTime(2026, 10, 8, 9, 10, 0), Message = "草稿已改变，未覆盖当前草稿。" };
+                using (TestResultDialog dialog = new TestResultDialog(record, adjustment, "模型列表暂未刷新，仍可测试。", null))
+                {
+                    dialog.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                    dialog.ClientSize = new Size((int)(width * scale), (int)(430 * scale));
+                    // Native scrolling needs a visible-state host. Keep this fixture transparent,
+                    // off screen and non-activating so it never occupies the user's desktop.
+                    dialog.hiddenVerification = true;
+                    dialog.Opacity = 0;
+                    dialog.StartPosition = FormStartPosition.Manual;
+                    dialog.Location = new Point(-32000, -32000);
+                    dialog.Show();
+                    IntPtr handle = dialog.Handle;
+                    IntPtr viewportHandle = dialog.viewport.Handle;
+                    IntPtr footerHandle = dialog.footer.Handle;
+                    foreach (Control c in dialog.rows) { IntPtr child = c.Handle; }
+                    dialog.PerformLayout();
+                    dialog.LayoutContent();
+                    bool state = dialog.headline.Text == (success ? "请求成功" : "请求失败")
+                        && (record.FinalModel.Length > 0 || dialog.model.Text == "未确认实际响应模型")
+                        && !dialog.detailsExpanded
+                        && dialog.AcceptButton == dialog.closeButton && dialog.CancelButton == dialog.closeButton
+                        && (!success || dialog.rows.OfType<Label>().Any(delegate(Label label) { return label.Text == "2026-10-08 09:10"; }));
+                    string diagnostic = "initial=" + state;
+                    dialog.ToggleDetails();
+                    dialog.LayoutContent();
+                    int bottom = int.MinValue;
+                    foreach (Control c in dialog.rows)
+                    {
+                        state = state && c.Width > 0 && c.Height > 0 && c.Top >= bottom
+                            && c.Left >= 0 && c.Right <= dialog.viewport.ClientSize.Width;
+                        bottom = c.Bottom;
+                    }
+                    diagnostic += ",rows=" + state;
+                    foreach (Button b in new[] { dialog.closeButton, dialog.logButton, dialog.planButton })
+                        if (b != dialog.planButton || success) state = state && dialog.footer.ClientRectangle.Contains(b.Bounds);
+                    diagnostic += ",footer=" + state;
+                    dialog.ScrollRowIntoView(dialog.details);
+                    state = state && dialog.viewport.ClientRectangle.IntersectsWith(dialog.details.Bounds)
+                        && dialog.viewport.AutoScrollMinSize.Height > dialog.viewport.ClientSize.Height;
+                    diagnostic += ",scroll=" + state + ":" + dialog.details.Bounds + "/" + dialog.viewport.ClientRectangle
+                        + "/min=" + dialog.viewport.AutoScrollMinSize + "/offset=" + dialog.viewport.AutoScrollPosition + "/v=" + dialog.viewport.VerticalScroll.Visible;
+                    dialog.ToggleDetails();
+                    state = state && !dialog.detailsExpanded;
+                    dialog.ToggleDetails();
+                    dialog.UpdateCatalogFeedback("目录刷新失败，不影响本次请求。");
+                    state = state && dialog.headline.Text == (success ? "请求成功" : "请求失败");
+                    if (success)
+                    {
+                        MethodInfo click = typeof(Button).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic);
+                        click.Invoke(dialog.planButton, new object[] { EventArgs.Empty });
+                        state = state && dialog.DialogResult == DialogResult.Yes;
+                    }
+                    state = state && BuildDetails(record).IndexOf("provider：openai", StringComparison.Ordinal) < 0;
+                    ok = ok && state;
+                    checks.Add(success + "/" + width + "/" + scale + "=" + state + "[" + diagnostic + "]");
+                }
+            }
+            foreach (string reason in new[] { "序列次数为 0，未应用预填。", "序列次数为空或无效，未应用预填。", "草稿已修改，未应用预填。", "未获得可靠重置时间，未应用预填。" })
+            using (TestResultDialog dialog = new TestResultDialog(new RunRecord { Success = true, Model = "requested-only" },
+                new ResetScheduleAdjustment { Message = reason }, "模型列表已刷新。", null))
+            {
+                bool state = dialog.headline.Text == "请求成功" && dialog.model.Text == "未确认实际响应模型"
+                    && !dialog.planApplied && dialog.rows.OfType<Label>().Any(delegate(Label label) { return label.Text == reason; });
+                checks.Add("skip:" + reason + "=" + state);
+                ok = ok && state;
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+    }
+
     internal sealed class ResetScheduleAdjustment
     {
         public bool Applied { get; set; }
@@ -2324,6 +3029,61 @@ namespace CodexQuotaWaker
         public ResetScheduleAdjustment()
         {
             Message = string.Empty;
+        }
+    }
+
+    internal sealed class ManualTestScheduleSnapshot
+    {
+        public string SequenceCountText { get; set; }
+        public DateTime SequenceStart { get; set; }
+        public int SequenceIntervalMinutes { get; set; }
+        public List<string> ExtraWakeTimes { get; set; }
+    }
+
+    internal static class ManualTestSchedulePolicy
+    {
+        public static ResetScheduleAdjustment EvaluateReset(
+            RunRecord record,
+            ManualTestScheduleSnapshot before,
+            ManualTestScheduleSnapshot after,
+            DateTime now)
+        {
+            if (!DraftMatches(before, after))
+            {
+                return Skipped("测试期间计划输入已修改，已保留当前草稿，未应用额度重置预填。");
+            }
+
+            int count;
+            if (!SequenceCountInput.TryParse(before.SequenceCountText, out count))
+            {
+                return Skipped("序列次数为空或无效，未应用额度重置预填；计划草稿保持不变。");
+            }
+            if (count == 0)
+            {
+                return Skipped("序列次数为 0，未应用额度重置预填；计划草稿保持不变。");
+            }
+
+            return ResetSchedulePlanner.Evaluate(record, count, now);
+        }
+
+        private static bool DraftMatches(ManualTestScheduleSnapshot first, ManualTestScheduleSnapshot second)
+        {
+            if (first == null || second == null
+                || !string.Equals(first.SequenceCountText, second.SequenceCountText, StringComparison.Ordinal)
+                || first.SequenceStart != second.SequenceStart
+                || first.SequenceIntervalMinutes != second.SequenceIntervalMinutes)
+            {
+                return false;
+            }
+
+            List<string> firstExtras = first.ExtraWakeTimes ?? new List<string>();
+            List<string> secondExtras = second.ExtraWakeTimes ?? new List<string>();
+            return firstExtras.SequenceEqual(secondExtras, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static ResetScheduleAdjustment Skipped(string message)
+        {
+            return new ResetScheduleAdjustment { Message = message };
         }
     }
 
@@ -2735,6 +3495,9 @@ namespace CodexQuotaWaker
         public string LogonType { get; set; }
         public string UserId { get; set; }
         public string Error { get; set; }
+        public DateTime? NextRunTime { get; set; }
+        public DateTime? LastRunTime { get; set; }
+        public string RuntimeDetailsError { get; set; }
 
         public bool CanRunWithoutLogon
         {
@@ -3253,7 +4016,7 @@ namespace CodexQuotaWaker
                 document.LoadXml(result.StandardOutput);
                 XmlNode settings = document.SelectSingleNode("//*[local-name()='Settings']");
                 XmlNode principal = document.SelectSingleNode("//*[local-name()='Principal']");
-                return new WindowsTaskStatus
+                WindowsTaskStatus status = new WindowsTaskStatus
                 {
                     Exists = true,
                     Enabled = ReadBoolean(settings, "Enabled", true),
@@ -3261,11 +4024,56 @@ namespace CodexQuotaWaker
                     LogonType = ReadText(principal, "LogonType"),
                     UserId = ReadText(principal, "UserId")
                 };
+                try { ReadScheduledTaskTimes(status); }
+                catch (Exception ex) { status.RuntimeDetailsError = "Windows 已安装计划，但无法读取实际运行时间：" + ex.GetType().Name + "。请重试刷新，或检查任务计划程序服务。"; }
+                return status;
             }
             catch (Exception ex)
             {
                 return new WindowsTaskStatus { Exists = true, Error = "无法读取 Windows 计划状态：" + ex.Message };
             }
+        }
+
+        private static void ReadScheduledTaskTimes(WindowsTaskStatus status)
+        {
+            Type serviceType = Type.GetTypeFromProgID("Schedule.Service");
+            if (serviceType == null) throw new InvalidOperationException("Task Scheduler is unavailable");
+            object service = null;
+            object folder = null;
+            object task = null;
+            try
+            {
+                service = Activator.CreateInstance(serviceType);
+                serviceType.InvokeMember("Connect", BindingFlags.InvokeMethod, null, service,
+                    new object[] { Type.Missing, Type.Missing, Type.Missing, Type.Missing }, CultureInfo.InvariantCulture);
+                folder = serviceType.InvokeMember("GetFolder", BindingFlags.InvokeMethod, null, service,
+                    new object[] { "\\" }, CultureInfo.InvariantCulture);
+                task = folder.GetType().InvokeMember("GetTask", BindingFlags.InvokeMethod, null, folder,
+                    new object[] { TaskXml.TaskName }, CultureInfo.InvariantCulture);
+                status.NextRunTime = ReadScheduledDate(task, "NextRunTime");
+                status.LastRunTime = ReadScheduledDate(task, "LastRunTime");
+            }
+            finally
+            {
+                ReleaseCom(task);
+                ReleaseCom(folder);
+                ReleaseCom(service);
+            }
+        }
+
+        private static DateTime? ReadScheduledDate(object task, string propertyName)
+        {
+            object value = task.GetType().InvokeMember(propertyName, BindingFlags.GetProperty, null, task, null, CultureInfo.InvariantCulture);
+            if (value == null) return null;
+            DateTime parsed;
+            if (value is DateTime) parsed = (DateTime)value;
+            else if (!DateTime.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out parsed)) return null;
+            return parsed.Year <= 1601 ? (DateTime?)null : DateTime.SpecifyKind(parsed, DateTimeKind.Local);
+        }
+
+        private static void ReleaseCom(object value)
+        {
+            if (value != null && Marshal.IsComObject(value)) Marshal.FinalReleaseComObject(value);
         }
 
         private static bool ReadBoolean(XmlNode parent, string localName, bool defaultValue)
@@ -3371,6 +4179,89 @@ namespace CodexQuotaWaker
                     && json.IndexOf("KeepAwakeMinutes", StringComparison.Ordinal) < 0;
                 lines.Add("JsonRoundTrip=" + jsonOk);
                 success = success && jsonOk;
+
+                AppConfig blankModelConfig = new AppConfig();
+                blankModelConfig.Model = " ";
+                AppConfig.Normalize(blankModelConfig);
+                AppConfig legacyDefaultConfig = new AppConfig();
+                legacyDefaultConfig.Model = AppConfig.LegacyDefaultRequestModel;
+                bool migratedLegacyDefault = AppConfig.MigrateLegacyDefaultModelToDraft(legacyDefaultConfig);
+                AppConfig explicitlySelectedLegacyModel = new AppConfig();
+                explicitlySelectedLegacyModel.Model = AppConfig.LegacyDefaultRequestModel;
+                explicitlySelectedLegacyModel.RequestModelSelectionConfirmed = true;
+                AppConfig restoredExplicitLegacyModel = JsonStore.Deserialize<AppConfig>(JsonStore.Serialize(explicitlySelectedLegacyModel));
+                bool preservedExplicitLegacyModel = restoredExplicitLegacyModel != null
+                    && restoredExplicitLegacyModel.RequestModelSelectionConfirmed
+                    && !AppConfig.MigrateLegacyDefaultModelToDraft(restoredExplicitLegacyModel)
+                    && restoredExplicitLegacyModel.Model == AppConfig.LegacyDefaultRequestModel;
+                AppConfig customModelConfig = new AppConfig();
+                customModelConfig.Model = "custom-model-slug";
+                bool preservedCustomModel = !AppConfig.MigrateLegacyDefaultModelToDraft(customModelConfig)
+                    && customModelConfig.Model == "custom-model-slug";
+                bool requestModelsOk = new AppConfig().Model == AppConfig.DefaultRequestModel
+                    && AppConfig.Normalize(null).Model == AppConfig.DefaultRequestModel
+                    && blankModelConfig.Model == AppConfig.DefaultRequestModel
+                    && migratedLegacyDefault
+                    && legacyDefaultConfig.Model == AppConfig.DefaultRequestModel
+                    && preservedExplicitLegacyModel
+                    && preservedCustomModel
+                    && string.Join("|", AppConfig.ListedRequestModels()) == "gpt-6-luna|gpt-6-sol|gpt-6.1-sol|gpt-6-astra";
+                lines.Add("RequestModelDefaultsAndMigration=" + requestModelsOk);
+                success = success && requestModelsOk;
+
+                string catalogFixture = "{\"models\":["
+                    + "{\"slug\":\"gpt-6.2-sol\",\"display_name\":\"GPT-6.2-Sol\",\"visibility\":\"list\",\"supported_in_api\":true,\"model_messages\":{\"persistent_instructions\":\"untrusted catalog text\"}},"
+                    + "{\"slug\":\"GPT-6.2-Sol\",\"display_name\":\"Duplicate\",\"visibility\":\"list\",\"supported_in_api\":true},"
+                    + "{\"slug\":\"gpt-hidden\",\"display_name\":\"Hidden\",\"visibility\":\"unlisted\",\"supported_in_api\":true},"
+                    + "{\"slug\":\"gpt-disabled\",\"display_name\":\"Disabled\",\"visibility\":\"list\",\"supported_in_api\":false},"
+                    + "{\"slug\":\"bad/model\",\"display_name\":\"Bad\",\"visibility\":\"list\",\"supported_in_api\":true},"
+                    + "{\"slug\":\"gpt-6.1-sol\",\"display_name\":\"GPT-6.1-Sol\",\"visibility\":\"list\",\"supported_in_api\":true}] }";
+                RequestModelCatalogSnapshot parsedCatalog = RequestModelCatalogService.ParseCliCatalog(catalogFixture);
+                bool catalogParsingOk = parsedCatalog != null
+                    && parsedCatalog.Models.Count == 2
+                    && parsedCatalog.Models[0].Slug == "gpt-6.2-sol"
+                    && parsedCatalog.Models[1].Slug == "gpt-6.1-sol"
+                    && parsedCatalog.Models[0].DisplayName == "GPT-6.2-Sol"
+                    && RequestModelCatalogService.ParseCliCatalog("{\"models\":{\"unexpected\":true}}") == null;
+                lines.Add("ModelCatalogParseFilterOrderAndDedup=" + catalogParsingOk);
+                success = success && catalogParsingOk;
+
+                if (parsedCatalog != null)
+                {
+                    parsedCatalog.RefreshedAtUtc = "2026-10-04T00:00:00.0000000Z";
+                }
+                string safeCatalogCache = RequestModelCatalogService.SerializeCache(parsedCatalog);
+                RequestModelCatalogSnapshot loadedCatalogCache = RequestModelCatalogService.ParseCache(safeCatalogCache);
+                RequestModelCatalogSnapshot missingCatalogCache = RequestModelCatalogService.ParseCacheOrFallback(string.Empty);
+                RequestModelCatalogSnapshot invalidCatalogCache = RequestModelCatalogService.ParseCacheOrFallback("not-json");
+                bool cacheWhitelistOk = loadedCatalogCache != null
+                    && loadedCatalogCache.Models.Count == 2
+                    && safeCatalogCache.IndexOf("model_messages", StringComparison.OrdinalIgnoreCase) < 0
+                    && safeCatalogCache.IndexOf("persistent_instructions", StringComparison.OrdinalIgnoreCase) < 0
+                    && safeCatalogCache.IndexOf("visibility", StringComparison.OrdinalIgnoreCase) < 0
+                    && safeCatalogCache.IndexOf("supported_in_api", StringComparison.OrdinalIgnoreCase) < 0
+                    && safeCatalogCache.IndexOf("untrusted catalog text", StringComparison.OrdinalIgnoreCase) < 0;
+                bool cacheFallbackOk = missingCatalogCache.Models.Count == AppConfig.ListedRequestModels().Length
+                    && invalidCatalogCache.Models.Count == AppConfig.ListedRequestModels().Length;
+                lines.Add("ModelCatalogCacheWhitelist=" + cacheWhitelistOk);
+                lines.Add("ModelCatalogMissingOrBadCacheFallback=" + cacheFallbackOk);
+                success = success && cacheWhitelistOk && cacheFallbackOk;
+
+                ProcessResult timedOutCatalogProcess = new ProcessResult { TimedOut = true };
+                ProcessResult failedCatalogProcess = new ProcessResult { ExitCode = 1, StandardError = "untrusted-secret-output" };
+                RequestModelCatalogRefreshResult timedOutCatalog = RequestModelCatalogService.Evaluate(timedOutCatalogProcess);
+                RequestModelCatalogRefreshResult failedCatalog = RequestModelCatalogService.Evaluate(failedCatalogProcess);
+                bool catalogFailurePolicyOk = RequestModelCatalogService.TimeoutMilliseconds == 10000
+                    && !timedOutCatalog.Success && timedOutCatalog.TimedOut
+                    && !failedCatalog.Success && !failedCatalog.TimedOut;
+                lines.Add("ModelCatalogTimeoutAndCommandFailure=" + catalogFailurePolicyOk);
+                success = success && catalogFailurePolicyOk;
+
+                string modelCatalogInteractionEvidence;
+                bool modelCatalogInteractionOk = MainForm.VerifyRequestModelCatalogInteraction(out modelCatalogInteractionEvidence);
+                lines.Add("RequestModelCatalogInteractionEvidence=" + modelCatalogInteractionEvidence);
+                lines.Add("RequestModelCatalogSelectionAndSnapshot=" + modelCatalogInteractionOk);
+                success = success && modelCatalogInteractionOk;
 
                 bool autoSleepPolicyOk =
                     AutoSleepPolicy.Evaluate(true, "scheduled", true, true, false) == "ready"
@@ -3523,13 +4414,28 @@ namespace CodexQuotaWaker
                 lines.Add("SequenceStartNextMinute=" + shortcutTimeOk);
                 success = success && shortcutTimeOk;
 
-                bool shortcutStateOk = !SequenceStartShortcut.IsEnabled("0")
-                    && !SequenceStartShortcut.IsEnabled(" ")
-                    && !SequenceStartShortcut.IsEnabled("abc")
-                    && SequenceStartShortcut.IsEnabled("1")
-                    && SequenceStartShortcut.IsEnabled(" 2 ");
-                lines.Add("SequenceStartShortcutState=" + shortcutStateOk);
-                success = success && shortcutStateOk;
+                string inputOrderEvidence;
+                bool inputOrderOk = MainForm.VerifyFlexiblePlanInputOrder(out inputOrderEvidence);
+                lines.Add("FlexiblePlanInputOrderEvidence=" + inputOrderEvidence);
+                lines.Add("FlexiblePlanInputOrder=" + inputOrderOk);
+                success = success && inputOrderOk;
+
+                string manualTestEvidence;
+                bool manualTestValidationOk = MainForm.VerifyManualTestValidationIsolation(out manualTestEvidence);
+                lines.Add("ManualTestValidationIsolationEvidence=" + manualTestEvidence);
+                lines.Add("ManualTestValidationIsolation=" + manualTestValidationOk);
+                success = success && manualTestValidationOk;
+
+                string resultDialogEvidence;
+                bool resultDialogOk = TestResultDialog.Verify(out resultDialogEvidence);
+                lines.Add("TestResultDialogEvidence=" + resultDialogEvidence);
+                lines.Add("TestResultDialog=" + resultDialogOk);
+                success = success && resultDialogOk;
+                string planNavigationEvidence;
+                bool planNavigationOk = MainForm.VerifyResultPlanNavigation(out planNavigationEvidence);
+                lines.Add("ResultPlanNavigationEvidence=" + planNavigationEvidence);
+                lines.Add("ResultPlanNavigation=" + planNavigationOk);
+                success = success && planNavigationOk;
 
                 bool budgetOk = ExecutionBudget.TotalSeconds(3) == 870
                     && ExecutionBudget.TaskExecutionLimitMinutes(3) == 16;
@@ -3680,6 +4586,12 @@ namespace CodexQuotaWaker
                     && !string.IsNullOrWhiteSpace(detectedRoute.Summary);
                 lines.Add("RouteDetection=" + routeDetectionOk);
                 success = success && routeDetectionOk;
+                string presentationGeometry;
+                bool presentationOk = MainForm.VerifyPresentation(out presentationGeometry);
+                lines.Add("PresentationGeometryEvidence=" + presentationGeometry);
+                lines.Add("PresentationGeometryRegression=" + presentationOk);
+                lines.Add("ModernUiConstructionAndDetails=" + presentationOk);
+                success = success && presentationOk;
             }
             catch (Exception ex)
             {
@@ -3740,13 +4652,81 @@ namespace CodexQuotaWaker
         }
     }
 
+    internal sealed class RoundedCardPanel : Panel
+    {
+        public RoundedCardPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
+            BackColor = Color.White;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (Width < 2 || Height < 2) return;
+            int radius = Math.Max(8, 14 * Math.Max(96, DeviceDpi) / 96);
+            using (GraphicsPath path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
+                Region = new Region(path);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            int radius = Math.Max(8, 14 * Math.Max(96, DeviceDpi) / 96);
+            using (GraphicsPath path = RoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
+            using (Pen border = new Pen(Color.FromArgb(238, 235, 243)))
+                e.Graphics.DrawPath(border, path);
+        }
+
+        private static GraphicsPath RoundedPath(Rectangle bounds, int radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
     internal sealed class MainForm : Form
     {
+        private readonly Panel viewport;
+        private readonly TableLayoutPanel pageRoot;
+        private readonly TableLayoutPanel mainGrid;
+        private readonly Panel heroCard;
+        private readonly FlowLayoutPanel leftStack;
+        private readonly FlowLayoutPanel rightStack;
+        private readonly Label nextRunLabel;
+        private readonly Label nextRunDateLabel;
+        private readonly Label heroHintLabel;
+        private readonly Label installedSummaryLabel;
+        private readonly Button installedDetailsButton;
+        private readonly Button routeDetailsButton;
+        private readonly FlowLayoutPanel advancedBody;
+        private readonly Button advancedToggleButton;
+        private readonly Panel advancedCard;
+        private readonly Panel routeCard;
+        private readonly Panel installedCard;
+        private DateTime? installedNextRunTime;
+        private bool installedTaskExists;
+        private bool installedTaskEnabled;
+        private bool installedDetailsExpanded;
+        private bool routeDetailsExpanded;
+        private bool advancedExpanded;
+        private bool hasUnsavedChanges;
+        private bool legacyDefaultModelMigrationPending;
+        private readonly Label resultSummaryLabel;
+        private readonly Button resultDetailsButton;
         private readonly Label statusLabel;
         private readonly Label planDetailLabel;
         private readonly Label routeStatusLabel;
         private readonly Label routeModelLabel;
         private readonly Label routeDetailLabel;
+        private readonly Label modelCatalogFeedbackLabel;
         private readonly Button routeRefreshButton;
         private readonly Button routeTestButton;
         private readonly Panel sequenceSchedulePanel;
@@ -3754,447 +4734,1489 @@ namespace CodexQuotaWaker
         private readonly DateTimePicker sequenceTimePicker;
         private readonly Button sequenceNowButton;
         private readonly TextBox sequenceCountBox;
-        private readonly NumericUpDown sequenceIntervalHoursBox;
-        private readonly NumericUpDown sequenceIntervalMinutesBox;
+        private NumericUpDown sequenceIntervalHoursBox;
+        private NumericUpDown sequenceIntervalMinutesBox;
         private readonly Label sequenceSummaryLabel;
         private readonly DateTimePicker extraWakeDatePicker;
         private readonly DateTimePicker extraWakeTimePicker;
+        private readonly Button addExtraWakeButton;
+        private readonly Button removeExtraWakeButton;
         private readonly ListBox extraWakeList;
         private readonly ListView timelineList;
         private readonly Label timelineSummaryLabel;
-        private readonly ComboBox modelBox;
+        private ComboBox modelBox;
+        private RequestModelCatalogSnapshot modelCatalogSnapshot;
+        private bool updatingModelCatalogChoices;
         private readonly TextBox promptBox;
-        private readonly NumericUpDown retryBox;
+        private NumericUpDown retryBox;
         private readonly CheckBox runWithoutLogonCheck;
         private readonly CheckBox autoSleepCheck;
         private readonly TextBox resultBox;
         private readonly Button saveButton;
         private readonly Button pauseButton;
         private readonly Button deleteTaskButton;
+        private readonly Button openLogButton;
+        private bool resultDetailsExpanded;
         private AppConfig config;
 
         public MainForm()
         {
             Text = "Codex 额度唤醒器";
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(820, 680);
-            Size = new Size(920, 900);
+            MinimumSize = new Size(760, 620);
+            Size = new Size(1180, 940);
             Font = new Font("Microsoft YaHei UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
-            BackColor = Color.FromArgb(247, 248, 250);
+            BackColor = Color.FromArgb(247, 247, 250);
 
-            Panel viewport = new Panel();
-            viewport.Dock = DockStyle.Fill;
-            viewport.AutoScroll = true;
+            viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = BackColor };
             Controls.Add(viewport);
+            pageRoot = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(30, 24, 30, 28),
+                ColumnCount = 1,
+                RowCount = 4,
+                BackColor = BackColor
+            };
+            pageRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            for (int row = 0; row < 4; row++) pageRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            viewport.Controls.Add(pageRoot);
 
-            TableLayoutPanel root = new TableLayoutPanel();
-            root.Dock = DockStyle.Top;
-            root.AutoSize = true;
-            root.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            root.Padding = new Padding(24);
-            root.ColumnCount = 1;
-            root.RowCount = 9;
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 136F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 225F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 285F));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 360F));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            viewport.Controls.Add(root);
+            FlowLayoutPanel brand = NewFlow(false);
+            brand.Margin = new Padding(0, 0, 0, 20);
+            Panel mark = new Panel { Size = new Size(40, 40), BackColor = Color.FromArgb(234, 229, 252), Margin = new Padding(0, 0, 12, 0) };
+            Label markText = new Label { Text = "◷", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, Font = new Font("Segoe UI Symbol", 20F), ForeColor = Purple };
+            mark.Controls.Add(markText);
+            brand.Controls.Add(mark);
+            FlowLayoutPanel brandText = NewFlow(true);
+            brandText.Controls.Add(new Label { Text = "额度唤醒器", AutoSize = true, Font = new Font("Microsoft YaHei UI", 15F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0) });
+            brandText.Controls.Add(new Label { Text = "安排好时间，剩下的交给电脑。", AutoSize = true, Font = new Font("Microsoft YaHei UI", 9F), ForeColor = Muted, Margin = new Padding(0, 2, 0, 0) });
+            brand.Controls.Add(brandText);
+            pageRoot.Controls.Add(brand, 0, 0);
 
-            Label title = new Label();
-            title.Text = "Codex 额度唤醒器";
-            title.Font = new Font("Microsoft YaHei UI", 18F, FontStyle.Bold);
-            title.AutoSize = true;
-            title.Margin = new Padding(0, 0, 0, 4);
-            root.Controls.Add(title, 0, 0);
+            Panel heroBody;
+            heroCard = NewCard("", out heroBody, 172);
+            heroCard.Dock = DockStyle.Top;
+            TableLayoutPanel heroLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(2, 4, 2, 4) };
+            heroLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72F));
+            heroLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28F));
+            heroBody.Controls.Add(heroLayout);
+            FlowLayoutPanel heroLeft = NewFlow(true);
+            heroLeft.Controls.Add(new Label { Text = "下一次唤醒", AutoSize = true, ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 2) });
+            nextRunLabel = new Label { Text = "尚未安排", AutoSize = true, ForeColor = Purple, Font = new Font("Microsoft YaHei UI", 36F, FontStyle.Bold), Margin = new Padding(0, 0, 0, 0) };
+            heroLeft.Controls.Add(nextRunLabel);
+            nextRunDateLabel = new Label { Text = "", AutoSize = true, ForeColor = Color.FromArgb(89, 82, 105), Font = new Font("Microsoft YaHei UI", 12F), Margin = new Padding(0, 0, 0, 4) };
+            heroLeft.Controls.Add(nextRunDateLabel);
+            heroHintLabel = new Label { Text = "正在读取计划…", AutoSize = true, ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Margin = new Padding(0, 2, 0, 0) };
+            heroLeft.Controls.Add(heroHintLabel);
+            heroLayout.Controls.Add(heroLeft, 0, 0);
+            FlowLayoutPanel heroRight = NewFlow(true);
+            heroRight.FlowDirection = FlowDirection.TopDown;
+            heroRight.WrapContents = false;
+            heroRight.Anchor = AnchorStyles.Right | AnchorStyles.Top;
+            statusLabel = new Label { AutoSize = true, Padding = new Padding(10, 6, 10, 6), BackColor = Color.FromArgb(239, 236, 245), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold), Margin = new Padding(0, 4, 0, 8) };
+            heroRight.Controls.Add(statusLabel);
+            heroRight.Controls.Add(new Label { Text = "无需保持此窗口打开", AutoSize = true, ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Margin = new Padding(0) });
+            heroLayout.Controls.Add(heroRight, 1, 0);
+            pageRoot.Controls.Add(heroCard, 0, 1);
 
-            Panel planCard = new Panel();
-            planCard.Dock = DockStyle.Fill;
-            planCard.BackColor = Color.FromArgb(238, 246, 240);
-            planCard.BorderStyle = BorderStyle.FixedSingle;
-            planCard.Padding = new Padding(14, 10, 14, 10);
-            planCard.Margin = new Padding(0, 0, 0, 14);
-            root.Controls.Add(planCard, 0, 1);
+            mainGrid = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 22, 0, 0), BackColor = BackColor };
+            mainGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 51F));
+            mainGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49F));
+            mainGrid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            leftStack = NewFlow(true);
+            rightStack = NewFlow(true);
+            leftStack.AutoSize = false;
+            rightStack.AutoSize = false;
+            leftStack.Margin = new Padding(0, 0, 12, 0);
+            rightStack.Margin = new Padding(12, 0, 0, 0);
 
-            TableLayoutPanel planLayout = new TableLayoutPanel();
-            planLayout.Dock = DockStyle.Fill;
-            planLayout.ColumnCount = 1;
-            planLayout.RowCount = 3;
-            planLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            planLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            planLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            planCard.Controls.Add(planLayout);
+            Panel scheduleBody;
+            Panel scheduleCard = NewCard("安排唤醒", out scheduleBody, 570);
+            sequenceSchedulePanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
+            scheduleBody.Controls.Add(sequenceSchedulePanel);
+            TableLayoutPanel scheduleLayout = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 7, Padding = new Padding(0, 2, 0, 0) };
+            scheduleLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+            scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            sequenceSchedulePanel.AutoScroll = true;
+            sequenceSchedulePanel.Controls.Add(scheduleLayout);
 
-            Label planCaption = new Label();
-            planCaption.Text = "当前启用计划（Windows 实际状态）";
-            planCaption.AutoSize = true;
-            planCaption.ForeColor = Color.FromArgb(70, 74, 82);
-            planCaption.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            planLayout.Controls.Add(planCaption, 0, 0);
-
-            statusLabel = new Label();
-            statusLabel.AutoSize = true;
-            statusLabel.Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold);
-            statusLabel.ForeColor = Color.FromArgb(28, 125, 80);
-            planLayout.Controls.Add(statusLabel, 0, 1);
-
-            planDetailLabel = new Label();
-            planDetailLabel.Dock = DockStyle.Fill;
-            planDetailLabel.ForeColor = Color.FromArgb(70, 74, 82);
-            planDetailLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            planDetailLabel.Padding = new Padding(0, 4, 0, 0);
-            planLayout.Controls.Add(planDetailLabel, 0, 2);
-
-            Panel routeCard = new Panel();
-            routeCard.Dock = DockStyle.Fill;
-            routeCard.BackColor = Color.FromArgb(244, 247, 252);
-            routeCard.BorderStyle = BorderStyle.FixedSingle;
-            routeCard.Padding = new Padding(14, 10, 14, 10);
-            routeCard.Margin = new Padding(0, 0, 0, 14);
-            root.Controls.Add(routeCard, 0, 2);
-
-            TableLayoutPanel routeLayout = new TableLayoutPanel();
-            routeLayout.Dock = DockStyle.Fill;
-            routeLayout.ColumnCount = 1;
-            routeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            routeLayout.RowCount = 5;
-            routeLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            routeLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            routeLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            routeLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            routeLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            routeCard.Controls.Add(routeLayout);
-
-            Label routeCaption = NewLabel("请求链路测试");
-            routeCaption.ForeColor = Color.FromArgb(70, 74, 82);
-            routeLayout.Controls.Add(routeCaption, 0, 0);
-
-            routeStatusLabel = new Label();
-            routeStatusLabel.AutoSize = true;
-            routeStatusLabel.Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold);
-            routeStatusLabel.Margin = new Padding(0, 2, 0, 2);
-            routeLayout.Controls.Add(routeStatusLabel, 0, 1);
-
-            routeModelLabel = new Label();
-            routeModelLabel.AutoSize = true;
-            routeModelLabel.Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold);
-            routeModelLabel.Margin = new Padding(0, 0, 0, 2);
-            routeModelLabel.ForeColor = Color.FromArgb(35, 38, 44);
-            routeLayout.Controls.Add(routeModelLabel, 0, 2);
-
-            routeDetailLabel = new Label();
-            routeDetailLabel.AutoSize = true;
-            routeDetailLabel.MaximumSize = new Size(700, 0);
-            routeDetailLabel.Margin = new Padding(0, 2, 0, 4);
-            routeDetailLabel.ForeColor = Color.FromArgb(70, 74, 82);
-            routeDetailLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            routeLayout.Controls.Add(routeDetailLabel, 0, 3);
-
-            FlowLayoutPanel routeActions = new FlowLayoutPanel();
-            routeActions.AutoSize = true;
-            routeActions.WrapContents = false;
-            routeActions.Margin = new Padding(0, 4, 0, 0);
-            routeRefreshButton = NewButton("刷新配置", false);
-            routeRefreshButton.Click += delegate { RefreshRouteStatus(); };
-            routeActions.Controls.Add(routeRefreshButton);
-            routeTestButton = NewButton("测试请求链路", true);
-            routeTestButton.Click += async delegate { await TestNow(); };
-            routeActions.Controls.Add(routeTestButton);
-            routeLayout.Controls.Add(routeActions, 0, 4);
-
-            GroupBox scheduleGroup = NewGroup("执行计划");
-            root.Controls.Add(scheduleGroup, 0, 3);
-            TableLayoutPanel scheduleRoot = new TableLayoutPanel();
-            scheduleRoot.Dock = DockStyle.Fill;
-            scheduleRoot.Padding = new Padding(12, 8, 12, 10);
-            scheduleRoot.ColumnCount = 1;
-            scheduleRoot.RowCount = 1;
-            scheduleRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            scheduleGroup.Controls.Add(scheduleRoot);
-
-            sequenceSchedulePanel = new Panel();
-            sequenceSchedulePanel.Dock = DockStyle.Fill;
-            scheduleRoot.Controls.Add(sequenceSchedulePanel, 0, 0);
-
-            TableLayoutPanel sequenceLayout = new TableLayoutPanel();
-            sequenceLayout.Dock = DockStyle.Fill;
-            sequenceLayout.ColumnCount = 5;
-            sequenceLayout.RowCount = 5;
-            sequenceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            sequenceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-            sequenceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            sequenceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-            sequenceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            sequenceLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            sequenceLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            sequenceLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            sequenceLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            sequenceLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            sequenceSchedulePanel.Controls.Add(sequenceLayout);
-
-            sequenceLayout.Controls.Add(NewLabel("首次日期"), 0, 0);
-            sequenceDatePicker = new DateTimePicker();
-            sequenceDatePicker.Format = DateTimePickerFormat.Custom;
-            sequenceDatePicker.CustomFormat = "yyyy-MM-dd";
-            sequenceDatePicker.Dock = DockStyle.Fill;
-            sequenceDatePicker.ValueChanged += delegate { UpdateSequenceSummary(); };
-            sequenceLayout.Controls.Add(sequenceDatePicker, 1, 0);
-
-            sequenceLayout.Controls.Add(NewLabel("时间"), 2, 0);
-            sequenceTimePicker = new DateTimePicker();
-            sequenceTimePicker.Format = DateTimePickerFormat.Custom;
-            sequenceTimePicker.CustomFormat = "HH:mm";
-            sequenceTimePicker.ShowUpDown = true;
-            sequenceTimePicker.Dock = DockStyle.Fill;
-            sequenceTimePicker.ValueChanged += delegate { UpdateSequenceSummary(); };
-            sequenceLayout.Controls.Add(sequenceTimePicker, 3, 0);
-
+            FlowLayoutPanel startBlock = NewFlow(true);
+            startBlock.Margin = new Padding(0, 0, 0, 10);
+            startBlock.Controls.Add(FieldCaption("首次日期与时间"));
+            FlowLayoutPanel startInputs = NewFlow(false);
+            startInputs.WrapContents = true;
+            startInputs.Margin = new Padding(0);
+            sequenceDatePicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd", Width = 146, Margin = new Padding(0, 0, 8, 0) };
+            sequenceDatePicker.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            sequenceTimePicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 104, Margin = new Padding(0, 0, 8, 0) };
+            sequenceTimePicker.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
             sequenceNowButton = NewButton("现在", false);
-            sequenceNowButton.MinimumSize = new Size(72, 34);
-            sequenceNowButton.Width = 72;
+            sequenceNowButton.MinimumSize = new Size(66, 36);
+            sequenceNowButton.Width = 66;
             sequenceNowButton.Click += delegate { SetSequenceStartToNow(); };
-            sequenceLayout.Controls.Add(sequenceNowButton, 4, 0);
+            startInputs.Controls.Add(sequenceDatePicker);
+            startInputs.Controls.Add(sequenceTimePicker);
+            startInputs.Controls.Add(sequenceNowButton);
+            startBlock.Controls.Add(startInputs);
+            scheduleLayout.Controls.Add(startBlock, 0, 0);
 
-            sequenceLayout.Controls.Add(NewLabel("执行间隔"), 0, 1);
-            FlowLayoutPanel intervalPanel = new FlowLayoutPanel();
-            intervalPanel.AutoSize = true;
-            intervalPanel.WrapContents = false;
-            intervalPanel.Dock = DockStyle.Fill;
-            sequenceIntervalHoursBox = new NumericUpDown();
-            sequenceIntervalHoursBox.Minimum = 0;
-            sequenceIntervalHoursBox.Maximum = 168;
-            sequenceIntervalHoursBox.Value = 5;
-            sequenceIntervalHoursBox.Width = 72;
-            sequenceIntervalHoursBox.ValueChanged += delegate { UpdateSequenceSummary(); };
-            intervalPanel.Controls.Add(sequenceIntervalHoursBox);
-            intervalPanel.Controls.Add(NewLabel("小时"));
+            FlowLayoutPanel planFields = NewFlow(false);
+            planFields.WrapContents = true;
+            planFields.Margin = new Padding(0, 0, 0, 8);
+            planFields.Controls.Add(BuildIntervalField());
+            Panel countSlot;
+            Panel countField = NewField("执行次数（含首次）", out countSlot, 206, 78);
+            sequenceCountBox = new TextBox { Dock = DockStyle.Top, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 6, 0, 0) };
+            sequenceCountBox.TextChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            countSlot.Controls.Add(sequenceCountBox);
+            planFields.Controls.Add(countField);
+            scheduleLayout.Controls.Add(planFields, 0, 1);
 
-            sequenceIntervalMinutesBox = new NumericUpDown();
-            sequenceIntervalMinutesBox.Minimum = 0;
-            sequenceIntervalMinutesBox.Maximum = 59;
-            sequenceIntervalMinutesBox.Value = 10;
-            sequenceIntervalMinutesBox.Width = 72;
-            sequenceIntervalMinutesBox.ValueChanged += delegate { UpdateSequenceSummary(); };
-            intervalPanel.Controls.Add(sequenceIntervalMinutesBox);
-            intervalPanel.Controls.Add(NewLabel("分钟"));
-            sequenceLayout.Controls.Add(intervalPanel, 1, 1);
-
-            sequenceLayout.Controls.Add(NewLabel("序列执行次数（含首次，可为 0）"), 2, 1);
-            sequenceCountBox = new TextBox();
-            sequenceCountBox.Dock = DockStyle.Fill;
-            sequenceCountBox.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            sequenceCountBox.TextChanged += delegate { UpdateSequenceSummary(); };
-            sequenceLayout.Controls.Add(sequenceCountBox, 3, 1);
-
-            sequenceSummaryLabel = new Label();
-            sequenceSummaryLabel.AutoSize = true;
-            sequenceSummaryLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            sequenceSummaryLabel.ForeColor = Color.FromArgb(80, 84, 92);
-            sequenceSummaryLabel.Margin = new Padding(0, 8, 0, 0);
-            sequenceLayout.SetColumnSpan(sequenceSummaryLabel, 5);
-            sequenceLayout.Controls.Add(sequenceSummaryLabel, 0, 2);
-
-            FlowLayoutPanel extraWakeActions = new FlowLayoutPanel();
-            extraWakeActions.AutoSize = true;
-            extraWakeActions.WrapContents = false;
-            extraWakeActions.Margin = new Padding(0, 8, 0, 4);
-            sequenceLayout.SetColumnSpan(extraWakeActions, 5);
-            sequenceLayout.Controls.Add(extraWakeActions, 0, 3);
-            extraWakeActions.Controls.Add(NewLabel("插入额外唤醒"));
-            extraWakeDatePicker = new DateTimePicker();
-            extraWakeDatePicker.Format = DateTimePickerFormat.Custom;
-            extraWakeDatePicker.CustomFormat = "yyyy-MM-dd";
-            extraWakeDatePicker.Width = 112;
+            sequenceSummaryLabel = new Label { AutoSize = true, MaximumSize = new Size(640, 0), ForeColor = Purple, BackColor = Color.FromArgb(245, 242, 253), Padding = new Padding(11, 8, 11, 8), Margin = new Padding(0, 2, 0, 12), Font = new Font("Microsoft YaHei UI", 9F) };
+            scheduleLayout.Controls.Add(sequenceSummaryLabel, 0, 2);
+            scheduleLayout.Controls.Add(new Label { Text = "额外唤醒 · 可选", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0, 3, 0, 4) }, 0, 3);
+            FlowLayoutPanel extraWakeActions = NewFlow(false);
+            extraWakeActions.WrapContents = true;
+            extraWakeActions.Margin = new Padding(0, 0, 0, 5);
+            extraWakeDatePicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd", Width = 138, Margin = new Padding(0, 0, 7, 0) };
+            extraWakeTimePicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 100, Margin = new Padding(0, 0, 7, 0) };
+            addExtraWakeButton = NewButton("＋ 添加", false);
+            addExtraWakeButton.Click += delegate { AddExtraWake(); };
+            removeExtraWakeButton = NewButton("删除选中", false);
+            removeExtraWakeButton.Click += delegate { RemoveExtraWake(); };
             extraWakeActions.Controls.Add(extraWakeDatePicker);
-            extraWakeTimePicker = new DateTimePicker();
-            extraWakeTimePicker.Format = DateTimePickerFormat.Custom;
-            extraWakeTimePicker.CustomFormat = "HH:mm";
-            extraWakeTimePicker.ShowUpDown = true;
-            extraWakeTimePicker.Width = 74;
             extraWakeActions.Controls.Add(extraWakeTimePicker);
-            Button addExtraWake = NewButton("插入", false);
-            addExtraWake.Click += delegate { AddExtraWake(); };
-            extraWakeActions.Controls.Add(addExtraWake);
-            Button removeExtraWake = NewButton("删除选中", false);
-            removeExtraWake.Click += delegate { RemoveExtraWake(); };
-            extraWakeActions.Controls.Add(removeExtraWake);
+            extraWakeActions.Controls.Add(addExtraWakeButton);
+            extraWakeActions.Controls.Add(removeExtraWakeButton);
+            scheduleLayout.Controls.Add(extraWakeActions, 0, 4);
+            extraWakeList = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Microsoft YaHei UI", 9F), BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, 4, 0, 10) };
+            scheduleLayout.Controls.Add(extraWakeList, 0, 5);
 
-            extraWakeList = new ListBox();
-            extraWakeList.Dock = DockStyle.Fill;
-            extraWakeList.IntegralHeight = false;
-            extraWakeList.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            sequenceLayout.SetColumnSpan(extraWakeList, 5);
-            sequenceLayout.Controls.Add(extraWakeList, 0, 4);
+            FlowLayoutPanel planActions = NewFlow(false);
+            planActions.WrapContents = true;
+            planActions.Margin = new Padding(0, 5, 0, 0);
+            saveButton = NewButton("保存并启用计划  ↗", true);
+            saveButton.MinimumSize = new Size(190, 42);
+            saveButton.Click += delegate { SaveAndEnable(); };
+            pauseButton = NewButton("暂停计划", false);
+            pauseButton.Click += delegate { PauseSchedule(); };
+            planActions.Controls.Add(saveButton);
+            planActions.Controls.Add(pauseButton);
+            scheduleLayout.Controls.Add(planActions, 0, 6);
 
-            TableLayoutPanel options = new TableLayoutPanel();
-            options.Dock = DockStyle.Fill;
+            Panel advancedCardBody;
+            advancedCard = NewCard("更多设置", out advancedCardBody, 120);
+            advancedToggleButton = NewButton("展开高级设置  ＋", false);
+            advancedToggleButton.Dock = DockStyle.Top;
+            advancedToggleButton.Click += delegate { ToggleAdvancedSettings(); };
+            advancedCardBody.Controls.Add(advancedToggleButton);
+            advancedBody = NewFlow(true);
+            advancedBody.Visible = false;
+            advancedBody.Location = new Point(0, 46);
+            advancedBody.WrapContents = false;
+            advancedBody.Margin = new Padding(0, 10, 0, 0);
+            advancedCardBody.Controls.Add(advancedBody);
+            FlowLayoutPanel options = new FlowLayoutPanel();
+            options.FlowDirection = FlowDirection.TopDown;
+            options.WrapContents = false;
             options.AutoSize = true;
-            options.RowCount = 4;
-            options.ColumnCount = 4;
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55F));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45F));
-            options.Margin = new Padding(0, 12, 0, 8);
-            root.Controls.Add(options, 0, 4);
-
-            options.Controls.Add(NewLabel("模型"), 0, 0);
-            modelBox = new ComboBox();
-            modelBox.DropDownStyle = ComboBoxStyle.DropDown;
-            modelBox.Items.AddRange(new object[] { "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol" });
-            modelBox.Dock = DockStyle.Fill;
-            options.Controls.Add(modelBox, 1, 0);
-
-            options.Controls.Add(NewLabel("最多尝试次数（含首次）"), 2, 0);
-            retryBox = new NumericUpDown();
-            retryBox.Minimum = 1;
-            retryBox.Maximum = 5;
-            retryBox.Value = 3;
-            retryBox.Dock = DockStyle.Fill;
-            options.Controls.Add(retryBox, 3, 0);
-
-            runWithoutLogonCheck = new CheckBox();
-            runWithoutLogonCheck.Text = "重启或注销后仍运行";
-            runWithoutLogonCheck.AutoSize = true;
-            runWithoutLogonCheck.Margin = new Padding(0, 9, 0, 0);
+            options.Margin = new Padding(0, 0, 0, 8);
+            options.Controls.Add(BuildModelField());
+            options.Controls.Add(BuildRetryField());
+            runWithoutLogonCheck = new CheckBox { Text = "重启或注销后仍运行", AutoSize = true, Margin = new Padding(0, 8, 0, 0) };
             runWithoutLogonCheck.CheckedChanged += delegate
             {
-                if (runWithoutLogonCheck.Checked)
+                runWithoutLogonCheck.AccessibleName = runWithoutLogonCheck.Checked
+                    ? "重启或注销后仍运行；保存时需要输入当前 Windows 帐户密码，不能使用 PIN、指纹或人脸"
+                    : "未选择；普通睡眠唤醒不受影响，Windows 更新重启后可能漏跑";
+                MarkDraftChanged();
+            };
+            options.Controls.Add(runWithoutLogonCheck);
+            Label runWithoutLogonHint = new Label { Text = "普通睡眠唤醒不需要；开启后保存时需输入 Windows 帐户密码，开机 PIN、指纹和人脸不可用。", AutoSize = true, MaximumSize = new Size(680, 0), ForeColor = Muted, Margin = new Padding(0, 3, 0, 4) };
+            options.Controls.Add(runWithoutLogonHint);
+            autoSleepCheck = new CheckBox { Text = "任务唤醒电脑后，成功完成时自动睡眠", AutoSize = true, Margin = new Padding(0, 7, 0, 2) };
+            autoSleepCheck.CheckedChanged += delegate { MarkDraftChanged(); };
+            options.Controls.Add(autoSleepCheck);
+            options.Controls.Add(new Label { Text = "执行期间防睡眠与超时由程序自动管理。", AutoSize = true, ForeColor = Muted, Margin = new Padding(0, 2, 0, 6) });
+            advancedBody.Controls.Add(options);
+            Panel promptSlot;
+            Panel promptField = NewField("触发消息", out promptSlot, 420, 84);
+            promptBox = new TextBox { Multiline = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical, Font = new Font("Microsoft YaHei UI", 9F), BorderStyle = BorderStyle.FixedSingle };
+            promptBox.TextChanged += delegate { MarkDraftChanged(); };
+            promptSlot.Controls.Add(promptBox);
+            advancedBody.Controls.Add(promptField);
+
+            Panel routeBody;
+            routeCard = NewCard("请求链路", out routeBody, 250);
+            routeStatusLabel = new Label { AutoSize = true, Font = new Font("Microsoft YaHei UI", 13F, FontStyle.Bold), ForeColor = Purple, Margin = new Padding(0, 0, 0, 5) };
+            routeModelLabel = new Label { AutoSize = true, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0, 0, 0, 6) };
+            modelCatalogFeedbackLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Visible = false, Margin = new Padding(0, 0, 0, 5) };
+            routeDetailLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Visible = false, Margin = new Padding(0, 4, 0, 4) };
+            FlowLayoutPanel routeContent = NewFlow(true);
+            routeContent.WrapContents = false;
+            routeBody.Controls.Add(routeContent);
+            routeContent.Controls.Add(routeStatusLabel);
+            routeContent.Controls.Add(routeModelLabel);
+            routeContent.Controls.Add(modelCatalogFeedbackLabel);
+            routeContent.Controls.Add(routeDetailLabel);
+            FlowLayoutPanel routeActions = NewFlow(false);
+            routeActions.WrapContents = true;
+            routeActions.Margin = new Padding(0, 12, 0, 0);
+            routeRefreshButton = NewButton("刷新配置", false);
+            routeRefreshButton.Click += delegate { RefreshRouteStatus(); };
+            routeTestButton = NewButton("▷ 测试请求", true);
+            routeTestButton.Click += async delegate { await TestNow(); };
+            routeDetailsButton = NewButton("查看链路详情", false);
+            routeDetailsButton.Click += delegate { ToggleRouteDetails(); };
+            routeActions.Controls.Add(routeTestButton);
+            routeActions.Controls.Add(routeRefreshButton);
+            routeActions.Controls.Add(routeDetailsButton);
+            routeContent.Controls.Add(routeActions);
+
+            leftStack.Controls.Add(scheduleCard);
+            leftStack.Controls.Add(advancedCard);
+            leftStack.Controls.Add(routeCard);
+            mainGrid.Controls.Add(leftStack, 0, 0);
+
+            Panel timelineBody;
+            Panel timelineCard = NewCard("执行时间线", out timelineBody, 330);
+            timelineSummaryLabel = new Label { Dock = DockStyle.Top, Height = 28, ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F) };
+            timelineList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = false, BorderStyle = BorderStyle.None, HeaderStyle = ColumnHeaderStyle.Nonclickable, BackColor = Color.White, Font = new Font("Microsoft YaHei UI", 9F) };
+            timelineList.Columns.Add("状态", 72);
+            timelineList.Columns.Add("触发时间", 148);
+            timelineList.Columns.Add("来源", 220);
+            timelineList.Resize += delegate { ResizeTimelineColumns(); };
+            timelineBody.Controls.Add(timelineList);
+            timelineBody.Controls.Add(timelineSummaryLabel);
+
+            Panel resultBody;
+            Panel resultCard = NewCard("最近一次结果", out resultBody, 260);
+            resultSummaryLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
+            resultBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, BackColor = Color.FromArgb(248, 247, 250), Font = new Font("Microsoft YaHei UI", 9F), BorderStyle = BorderStyle.FixedSingle, Visible = false };
+            resultDetailsButton = NewButton("查看执行详情", false);
+            resultDetailsButton.Dock = DockStyle.Bottom;
+            resultDetailsButton.Click += delegate { ToggleResultDetails(); };
+            resultBody.Controls.Add(resultBox);
+            resultBody.Controls.Add(resultSummaryLabel);
+            resultBody.Controls.Add(resultDetailsButton);
+
+            SplitContainer dataSplit = new SplitContainer
+            {
+                Dock = DockStyle.Top,
+                Orientation = Orientation.Horizontal,
+                Size = new Size(600, 630),
+                Height = 610,
+                SplitterWidth = 10,
+                IsSplitterFixed = false,
+                BackColor = Color.FromArgb(226, 222, 234),
+                SplitterDistance = 340,
+                Panel1MinSize = 180,
+                Panel2MinSize = 190,
+                Margin = new Padding(0, 0, 0, 16)
+            };
+            dataSplit.Panel1.BackColor = BackColor;
+            dataSplit.Panel2.BackColor = BackColor;
+            timelineCard.Dock = DockStyle.Fill;
+            resultCard.Dock = DockStyle.Fill;
+            dataSplit.Panel1.Controls.Add(timelineCard);
+            dataSplit.Panel2.Controls.Add(resultCard);
+            rightStack.Controls.Add(dataSplit);
+
+            Panel installedBody;
+            installedCard = NewCard("Windows 计划状态", out installedBody, 230);
+            installedBody.AutoScroll = true;
+            installedSummaryLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
+            planDetailLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Visible = false, Margin = new Padding(0, 5, 0, 4) };
+            installedDetailsButton = NewButton("查看计划信息", false);
+            installedDetailsButton.Dock = DockStyle.Bottom;
+            installedDetailsButton.Click += delegate { ToggleInstalledDetails(); };
+            installedBody.Controls.Add(planDetailLabel);
+            installedBody.Controls.Add(installedSummaryLabel);
+            installedBody.Controls.Add(installedDetailsButton);
+            rightStack.Controls.Add(installedCard);
+            mainGrid.Controls.Add(rightStack, 1, 0);
+            pageRoot.Controls.Add(mainGrid, 0, 2);
+
+            FlowLayoutPanel footer = NewFlow(false);
+            footer.WrapContents = true;
+            footer.Margin = new Padding(0, 12, 0, 0);
+            footer.Controls.Add(new Label { Text = "后台使用 read-only 沙盒 · 程序不会读取或保存 ChatGPT 凭据", AutoSize = true, ForeColor = Muted, Margin = new Padding(0, 10, 20, 0) });
+            openLogButton = NewButton("打开日志", false);
+            openLogButton.Click += delegate { OpenLog(); };
+            deleteTaskButton = NewButton("删除计划", false);
+            deleteTaskButton.ForeColor = Color.FromArgb(161, 91, 109);
+            deleteTaskButton.Click += delegate { DeleteSchedule(); };
+            footer.Controls.Add(openLogButton);
+            footer.Controls.Add(deleteTaskButton);
+            pageRoot.Controls.Add(footer, 0, 3);
+
+            StyleInputs(pageRoot);
+            viewport.Resize += delegate { LayoutResponsive(); };
+            SizeChanged += delegate { LayoutResponsive(); };
+            Load += delegate
+            {
+                Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+                Size = new Size(Math.Min(Width, workingArea.Width), Math.Min(Height, workingArea.Height - 24));
+                CenterToScreen();
+                LayoutResponsive();
+                LoadState();
+            };
+        }
+
+        private static readonly Color Purple = Color.FromArgb(118, 96, 219);
+        private static readonly Color Ink = Color.FromArgb(41, 38, 49);
+        private static readonly Color Muted = Color.FromArgb(116, 107, 130);
+
+        private void LayoutResponsive()
+        {
+            if (viewport == null || pageRoot == null || mainGrid == null || leftStack == null || rightStack == null) return;
+            int available = Math.Max(300, viewport.ClientSize.Width - pageRoot.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth);
+            pageRoot.Width = available + pageRoot.Padding.Horizontal;
+            mainGrid.Width = available;
+            bool twoColumns = CanUseTwoColumns(available);
+            int leftContentWidth = available;
+            int rightContentWidth = available;
+            if (twoColumns)
+            {
+                mainGrid.SuspendLayout();
+                mainGrid.ColumnCount = 2;
+                mainGrid.RowCount = 1;
+                mainGrid.ColumnStyles.Clear();
+                mainGrid.RowStyles.Clear();
+                mainGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 51F));
+                mainGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 49F));
+                mainGrid.SetCellPosition(leftStack, new TableLayoutPanelCellPosition(0, 0));
+                mainGrid.SetCellPosition(rightStack, new TableLayoutPanelCellPosition(1, 0));
+                leftContentWidth = (available - 24) * 51 / 100;
+                rightContentWidth = available - leftContentWidth - 24;
+                leftStack.Width = leftContentWidth;
+                rightStack.Width = rightContentWidth;
+                leftStack.Margin = new Padding(0, 0, 12, 0);
+                rightStack.Margin = new Padding(12, 0, 0, 0);
+                mainGrid.ResumeLayout(false);
+            }
+            else
+            {
+                mainGrid.SuspendLayout();
+                mainGrid.ColumnCount = 1;
+                mainGrid.RowCount = 2;
+                mainGrid.ColumnStyles.Clear();
+                mainGrid.RowStyles.Clear();
+                mainGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                mainGrid.SetCellPosition(leftStack, new TableLayoutPanelCellPosition(0, 0));
+                mainGrid.SetCellPosition(rightStack, new TableLayoutPanelCellPosition(0, 1));
+                leftStack.Width = leftContentWidth;
+                rightStack.Width = rightContentWidth;
+                leftStack.Margin = new Padding(0);
+                rightStack.Margin = new Padding(0);
+                mainGrid.ResumeLayout(false);
+            }
+
+            // The TableLayoutPanel has not applied its new percentage-column bounds yet here.
+            // Use the widths calculated above instead of reading a stale ClientSize (often zero).
+            foreach (Control control in leftStack.Controls) control.Width = leftContentWidth;
+            foreach (Control control in rightStack.Controls) control.Width = rightContentWidth;
+            leftStack.Height = StackHeight(leftStack);
+            rightStack.Height = StackHeight(rightStack);
+            routeDetailLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
+            modelCatalogFeedbackLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
+            resultSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
+            installedSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
+            planDetailLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
+            sequenceSummaryLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
+
+            int leftHeight = leftStack.Height + leftStack.Margin.Vertical;
+            int rightHeight = rightStack.Height + rightStack.Margin.Vertical;
+            mainGrid.SuspendLayout();
+            mainGrid.RowStyles.Clear();
+            if (twoColumns)
+            {
+                mainGrid.RowCount = 1;
+                mainGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, Math.Max(leftHeight, rightHeight)));
+                mainGrid.Height = Math.Max(leftHeight, rightHeight);
+            }
+            else
+            {
+                mainGrid.RowCount = 2;
+                mainGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, leftHeight));
+                mainGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, rightHeight));
+                mainGrid.Height = leftHeight + rightHeight;
+            }
+            mainGrid.ResumeLayout(true);
+            pageRoot.PerformLayout();
+            mainGrid.PerformLayout();
+            leftStack.PerformLayout();
+            rightStack.PerformLayout();
+            pageRoot.PerformLayout();
+            ResizeTimelineColumns();
+        }
+
+        private static bool CanUseTwoColumns(int availableWidth)
+        {
+            return availableWidth >= 1040;
+        }
+
+        private int ScaleLayoutHeight(int logicalHeight)
+        {
+            float scale = 1F;
+            if (heroCard != null && heroCard.Height > 0)
+            {
+                scale = heroCard.Height / 172F;
+            }
+            return Math.Max(1, (int)Math.Round(logicalHeight * scale));
+        }
+
+        private static int StackHeight(FlowLayoutPanel stack)
+        {
+            int height = 0;
+            foreach (Control control in stack.Controls) height += control.Height + control.Margin.Vertical;
+            return height;
+        }
+
+        private static FlowLayoutPanel NewFlow(bool vertical)
+        {
+            return new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = vertical ? FlowDirection.TopDown : FlowDirection.LeftToRight,
+                WrapContents = !vertical,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.Transparent
+            };
+        }
+
+        private static Panel NewCard(string title, out Panel body, int height)
+        {
+            Panel card = new RoundedCardPanel { Height = height, BackColor = Color.White, Padding = new Padding(20), Margin = new Padding(0, 0, 0, 16) };
+            int headingHeight = string.IsNullOrWhiteSpace(title) ? 0 : 34;
+            TableLayoutPanel contentLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                ColumnCount = 1,
+                RowCount = 2,
+                GrowStyle = TableLayoutPanelGrowStyle.FixedSize,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            contentLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, headingHeight));
+            contentLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            Label heading = new Label
+            {
+                Text = title,
+                AutoSize = false,
+                AutoEllipsis = true,
+                Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold),
+                ForeColor = Ink,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill,
+                Margin = Padding.Empty
+            };
+            body = new Panel { Dock = DockStyle.Fill, BackColor = Color.White, Margin = new Padding(0), Padding = new Padding(0) };
+            contentLayout.Controls.Add(heading, 0, 0);
+            contentLayout.Controls.Add(body, 0, 1);
+            card.Controls.Add(contentLayout);
+            return card;
+        }
+
+        private static Label FieldCaption(string text)
+        {
+            return new Label { Text = text, AutoSize = true, ForeColor = Color.FromArgb(113, 106, 128), Font = new Font("Microsoft YaHei UI", 9F), Margin = new Padding(0, 0, 0, 6) };
+        }
+
+        private Panel BuildIntervalField()
+        {
+            Panel slot;
+            Panel field = NewField("每次间隔", out slot, 206, 78);
+            FlowLayoutPanel interval = NewFlow(false);
+            interval.WrapContents = false;
+            interval.Dock = DockStyle.Top;
+            sequenceIntervalHoursBox = new NumericUpDown { Minimum = 0, Maximum = 8760, Value = 5, Width = 66, Margin = new Padding(0, 6, 4, 0) };
+            sequenceIntervalHoursBox.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            sequenceIntervalMinutesBox = new NumericUpDown { Minimum = 0, Maximum = 59, Value = 10, Width = 66, Margin = new Padding(8, 6, 4, 0) };
+            sequenceIntervalMinutesBox.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            interval.Controls.Add(sequenceIntervalHoursBox);
+            interval.Controls.Add(new Label { Text = "时", AutoSize = true, ForeColor = Muted, Margin = new Padding(0, 12, 0, 0) });
+            interval.Controls.Add(sequenceIntervalMinutesBox);
+            interval.Controls.Add(new Label { Text = "分", AutoSize = true, ForeColor = Muted, Margin = new Padding(0, 12, 0, 0) });
+            slot.Controls.Add(interval);
+            return field;
+        }
+
+        private static Panel NewField(string title, out Panel slot, int width, int height)
+        {
+            Panel field = new Panel { Width = width, Height = height, Margin = new Padding(0, 0, 12, 4), BackColor = Color.White };
+            Label caption = FieldCaption(title);
+            caption.Dock = DockStyle.Top;
+            caption.Height = 24;
+            slot = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
+            field.Controls.Add(slot);
+            field.Controls.Add(caption);
+            return field;
+        }
+
+        private Panel BuildModelField()
+        {
+            Panel slot;
+            Panel field = NewField("请求模型", out slot, 380, 66);
+            modelBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Width = 320, Dock = DockStyle.Top, Margin = new Padding(0, 4, 0, 0) };
+            modelBox.Items.AddRange(AppConfig.ListedRequestModels());
+            modelCatalogSnapshot = RequestModelCatalogService.CreateBuiltIn();
+            modelBox.TextChanged += delegate { if (!updatingModelCatalogChoices) MarkDraftChanged(); };
+            modelBox.SelectedIndexChanged += delegate { if (!updatingModelCatalogChoices) MarkDraftChanged(); };
+            slot.Controls.Add(modelBox);
+            return field;
+        }
+
+        private void ReplaceModelCatalogChoices(IEnumerable<RequestModelCatalogEntry> entries)
+        {
+            if (modelBox == null)
+            {
+                return;
+            }
+
+            string currentText = modelBox.Text ?? string.Empty;
+            bool wasUpdating = updatingModelCatalogChoices;
+            bool updateStarted = false;
+            updatingModelCatalogChoices = true;
+            try
+            {
+                modelBox.BeginUpdate();
+                updateStarted = true;
+                modelBox.Items.Clear();
+                if (entries != null)
                 {
-                    runWithoutLogonCheck.AccessibleName = "重启或注销后仍运行；保存时需要输入当前 Windows 帐户密码，不能使用 PIN、指纹或人脸";
+                    foreach (RequestModelCatalogEntry entry in entries)
+                    {
+                        if (entry != null && !string.IsNullOrWhiteSpace(entry.Slug))
+                        {
+                            modelBox.Items.Add(entry.Slug);
+                        }
+                    }
+                }
+                modelBox.SelectedIndex = -1;
+                modelBox.Text = currentText;
+            }
+            finally
+            {
+                if (updateStarted)
+                {
+                    modelBox.EndUpdate();
+                }
+                updatingModelCatalogChoices = wasUpdating;
+            }
+        }
+
+        private string ApplyModelCatalogRefreshResult(RequestModelCatalogRefreshResult result, string requestModelSnapshot)
+        {
+            if (result == null || !result.Success || result.Snapshot == null || result.Snapshot.Models == null)
+            {
+                string failure = result != null && result.TimedOut
+                    ? "模型列表暂未刷新（超过 10 秒），仍可测试或手动输入。"
+                    : "模型列表暂未刷新，仍可测试或手动输入。";
+                SetModelCatalogFeedback(failure, true);
+                return failure;
+            }
+
+            string currentSelection = modelBox.Text ?? string.Empty;
+            RequestModelCatalogSnapshot previous = modelCatalogSnapshot ?? RequestModelCatalogService.CreateBuiltIn();
+            HashSet<string> previousSlugs = new HashSet<string>(
+                previous.Models.Select(delegate(RequestModelCatalogEntry item) { return item.Slug; }),
+                StringComparer.OrdinalIgnoreCase);
+            HashSet<string> refreshedSlugs = new HashSet<string>(
+                result.Snapshot.Models.Select(delegate(RequestModelCatalogEntry item) { return item.Slug; }),
+                StringComparer.OrdinalIgnoreCase);
+            List<RequestModelCatalogEntry> added = result.Snapshot.Models
+                .Where(delegate(RequestModelCatalogEntry item) { return !previousSlugs.Contains(item.Slug); })
+                .ToList();
+            bool selectionWasListed = previousSlugs.Contains(currentSelection.Trim());
+            bool selectionMissing = selectionWasListed && !refreshedSlugs.Contains(currentSelection.Trim());
+
+            ReplaceModelCatalogChoices(result.Snapshot.Models);
+            modelCatalogSnapshot = result.Snapshot;
+
+            StringBuilder feedback = new StringBuilder();
+            if (added.Count == 0)
+            {
+                feedback.Append("模型列表已刷新。");
+            }
+            else
+            {
+                feedback.Append("模型列表已刷新，新增 ").Append(added.Count).Append(" 个选项");
+                string[] examples = added.Take(2)
+                    .Select(delegate(RequestModelCatalogEntry item) { return item.DisplayName; })
+                    .ToArray();
+                if (examples.Length > 0)
+                {
+                    feedback.Append("（").Append(string.Join("、", examples));
+                    if (added.Count > examples.Length)
+                    {
+                        feedback.Append("等");
+                    }
+                    feedback.Append("）");
+                }
+                feedback.Append("。");
+            }
+
+            if (selectionMissing)
+            {
+                feedback.Append("当前选择“").Append(ShortModelLabel(currentSelection))
+                    .Append("”不在最新目录中，已保留；本次请求仍使用“")
+                    .Append(ShortModelLabel(requestModelSnapshot)).Append("”。");
+            }
+            else
+            {
+                feedback.Append("当前选择保持不变。");
+            }
+            if (!result.CacheSaved)
+            {
+                feedback.Append("本次列表可用，但缓存未写入；下次启动可能回退。");
+            }
+
+            string message = feedback.ToString();
+            SetModelCatalogFeedback(message, selectionMissing || !result.CacheSaved);
+            return message;
+        }
+
+        private void SetModelCatalogFeedback(string message, bool warning)
+        {
+            modelCatalogFeedbackLabel.Text = message ?? string.Empty;
+            modelCatalogFeedbackLabel.ForeColor = warning ? Color.FromArgb(160, 100, 20) : Muted;
+            modelCatalogFeedbackLabel.Visible = !string.IsNullOrWhiteSpace(message);
+            routeCard.Height = RouteCardLayoutHeight();
+            LayoutResponsive();
+        }
+
+        private int RouteCardLayoutHeight()
+        {
+            int height = routeDetailsExpanded ? 370 : 250;
+            if (modelCatalogFeedbackLabel != null && !string.IsNullOrWhiteSpace(modelCatalogFeedbackLabel.Text))
+            {
+                height += 44;
+            }
+            return ScaleLayoutHeight(height);
+        }
+
+        private static string ShortModelLabel(string value)
+        {
+            string safe = new string((value ?? string.Empty).Where(delegate(char c) { return !char.IsControl(c); }).ToArray()).Trim();
+            return safe.Length > 48 ? safe.Substring(0, 45) + "…" : safe;
+        }
+
+        private void QueueModelCatalogFeedback(Task<RequestModelCatalogRefreshResult> refreshTask, string requestModelSnapshot, TestResultDialog dialog)
+        {
+            refreshTask.ContinueWith(delegate(Task<RequestModelCatalogRefreshResult> completed)
+            {
+                RequestModelCatalogRefreshResult result = completed.IsFaulted || completed.IsCanceled
+                    ? new RequestModelCatalogRefreshResult()
+                    : completed.Result;
+                if (IsDisposed || Disposing || !IsHandleCreated)
+                {
+                    return;
+                }
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (!IsDisposed && !Disposing)
+                        {
+                            string feedback = ApplyModelCatalogRefreshResult(result, requestModelSnapshot);
+                            if (dialog != null && !dialog.IsDisposed && !dialog.Disposing)
+                                dialog.UpdateCatalogFeedback(feedback);
+                        }
+                    }));
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        private Panel BuildRetryField()
+        {
+            Panel slot;
+            Panel field = NewField("最多尝试次数（含首次）", out slot, 380, 66);
+            retryBox = new NumericUpDown { Minimum = 1, Maximum = 5, Value = 3, Width = 160, Dock = DockStyle.Top, Margin = new Padding(0, 4, 0, 0) };
+            retryBox.ValueChanged += delegate { MarkDraftChanged(); };
+            slot.Controls.Add(retryBox);
+            return field;
+        }
+
+        private void MarkDraftChanged()
+        {
+            hasUnsavedChanges = true;
+            if (heroHintLabel != null && !IsDisposed) heroHintLabel.Text = DraftHint();
+        }
+
+        private string DraftHint()
+        {
+            if (legacyDefaultModelMigrationPending
+                && modelBox != null
+                && string.Equals((modelBox.Text ?? string.Empty).Trim(), AppConfig.DefaultRequestModel, StringComparison.OrdinalIgnoreCase))
+            {
+                return "旧默认请求模型已预填为 GPT-6 Luna；保存并启用后才写入配置与计划。";
+            }
+            return "正在预览未保存的修改 · 保存后才会更新 Windows 计划";
+        }
+
+        private void ToggleAdvancedSettings()
+        {
+            advancedExpanded = !advancedExpanded;
+            advancedBody.Visible = advancedExpanded;
+            advancedToggleButton.Text = advancedExpanded ? "收起高级设置  −" : "展开高级设置  ＋";
+            advancedCard.Height = advancedExpanded
+                ? Math.Max(ScaleLayoutHeight(360), advancedBody.PreferredSize.Height + ScaleLayoutHeight(128))
+                : ScaleLayoutHeight(120);
+            LayoutResponsive();
+        }
+
+        private void ToggleRouteDetails()
+        {
+            routeDetailsExpanded = !routeDetailsExpanded;
+            routeDetailLabel.Visible = routeDetailsExpanded;
+            routeDetailsButton.Text = routeDetailsExpanded ? "收起链路详情" : "查看链路详情";
+            routeCard.Height = RouteCardLayoutHeight();
+            LayoutResponsive();
+        }
+
+        private void ToggleInstalledDetails()
+        {
+            installedDetailsExpanded = !installedDetailsExpanded;
+            planDetailLabel.Visible = installedDetailsExpanded;
+            installedDetailsButton.Text = installedDetailsExpanded ? "收起计划信息" : "查看计划信息";
+            installedCard.Height = ScaleLayoutHeight(installedDetailsExpanded ? 300 : 230);
+            LayoutResponsive();
+        }
+
+        private void ToggleResultDetails()
+        {
+            resultDetailsExpanded = !resultDetailsExpanded;
+            resultBox.Visible = resultDetailsExpanded;
+            resultSummaryLabel.Visible = !resultDetailsExpanded;
+            resultDetailsButton.Text = resultDetailsExpanded ? "收起执行详情" : "查看执行详情";
+        }
+
+        internal static bool VerifyPresentation(out string geometryEvidence)
+        {
+            string wideEvidence;
+            string narrowEvidence;
+            string scaledEvidence;
+            bool wide = VerifyLayoutScenario(1420, 880, 1F, true, out wideEvidence);
+            bool narrow = VerifyLayoutScenario(760, 620, 1F, false, out narrowEvidence);
+            bool scaled = VerifyLayoutScenario(1420, 880, 1.25F, true, out scaledEvidence);
+            geometryEvidence = "wide{" + wideEvidence + "}; narrow{" + narrowEvidence + "}; scaled{" + scaledEvidence + "}";
+            return wide && narrow && scaled;
+        }
+
+        internal static bool VerifyRequestModelCatalogInteraction(out string evidence)
+        {
+            try
+            {
+                using (MainForm form = new MainForm())
+                {
+                    form.StartPosition = FormStartPosition.Manual;
+                    form.ShowInTaskbar = false;
+                    form.ClientSize = new Size(960, 800);
+                    IntPtr formHandle = form.Handle;
+                    EnsureControlHandles(form);
+                    MethodInfo onLoad = typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (onLoad == null) throw new InvalidOperationException("无法触发 WinForms Load 模型目录路径。");
+                    onLoad.Invoke(form, new object[] { EventArgs.Empty });
+
+                    RequestModelCatalogSnapshot previous = CreateModelCatalogFixture("gpt-6-luna", "gpt-6-retired");
+                    RequestModelCatalogSnapshot refreshed = CreateModelCatalogFixture("gpt-6-luna", "gpt-6.1-sol", "gpt-6.2-sol");
+                    form.modelCatalogSnapshot = previous;
+                    form.ReplaceModelCatalogChoices(previous.Models);
+                    form.modelBox.Text = "gpt-6-retired";
+                    AppConfig requestSnapshot = form.ReadForm(false);
+                    bool dirtyBeforeUpdate = form.hasUnsavedChanges;
+                    RequestModelCatalogRefreshResult success = new RequestModelCatalogRefreshResult
+                    {
+                        Success = true,
+                        CacheSaved = true,
+                        Snapshot = refreshed
+                    };
+                    string firstFeedback = form.ApplyModelCatalogRefreshResult(success, requestSnapshot.Model);
+                    bool removedSelectionPreserved = form.modelBox.Text == "gpt-6-retired"
+                        && form.modelBox.Items.Contains("gpt-6.2-sol")
+                        && firstFeedback.IndexOf("不在最新目录中", StringComparison.Ordinal) >= 0;
+                    bool newModelReported = firstFeedback.IndexOf("新增 2 个选项", StringComparison.Ordinal) >= 0;
+                    bool requestSnapshotStable = requestSnapshot.Model == "gpt-6-retired"
+                        && firstFeedback.IndexOf("本次请求仍使用“gpt-6-retired”", StringComparison.Ordinal) >= 0;
+                    bool updateDidNotMarkDraft = form.hasUnsavedChanges == dirtyBeforeUpdate;
+                    PerformLayoutTree(form);
+                    form.LayoutResponsive();
+                    PerformLayoutTree(form);
+                    Rectangle feedbackBounds = form.modelCatalogFeedbackLabel.Bounds;
+                    Rectangle feedbackParentClient = form.modelCatalogFeedbackLabel.Parent.ClientRectangle;
+                    int expectedRouteHeight = form.RouteCardLayoutHeight();
+                    bool feedbackLayoutValid = !string.IsNullOrWhiteSpace(form.modelCatalogFeedbackLabel.Text)
+                        && feedbackParentClient.Contains(feedbackBounds)
+                        && form.routeCard.Height >= expectedRouteHeight;
+
+                    form.modelBox.Text = "vendor/custom-model";
+                    AppConfig customRequestSnapshot = form.ReadForm(false);
+                    string customFeedback = form.ApplyModelCatalogRefreshResult(success, customRequestSnapshot.Model);
+                    bool customSelectionPreserved = form.modelBox.Text == "vendor/custom-model"
+                        && customRequestSnapshot.Model == "vendor/custom-model"
+                        && customFeedback.IndexOf("当前选择保持不变", StringComparison.Ordinal) >= 0;
+
+                    string itemsBeforeFailure = string.Join("|", form.modelBox.Items.Cast<string>());
+                    RequestModelCatalogRefreshResult timeout = new RequestModelCatalogRefreshResult { TimedOut = true };
+                    string failureFeedback = form.ApplyModelCatalogRefreshResult(timeout, customRequestSnapshot.Model);
+                    string itemsAfterFailure = string.Join("|", form.modelBox.Items.Cast<string>());
+                    bool failurePreservesListAndSelection = itemsBeforeFailure == itemsAfterFailure
+                        && form.modelBox.Text == "vendor/custom-model"
+                        && failureFeedback.IndexOf("超过 10 秒", StringComparison.Ordinal) >= 0
+                        && failureFeedback.IndexOf("仍可测试或手动输入", StringComparison.Ordinal) >= 0;
+
+                    evidence = "removedSelectionPreserved=" + removedSelectionPreserved
+                        + "; newModelReported=" + newModelReported
+                        + "; requestSnapshotStable=" + requestSnapshotStable
+                        + "; customSelectionPreserved=" + customSelectionPreserved
+                        + "; updateDidNotMarkDraft=" + updateDidNotMarkDraft
+                        + "; failurePreservesListAndSelection=" + failurePreservesListAndSelection
+                        + "; feedbackLayoutValid=" + feedbackLayoutValid
+                        + "[label=" + feedbackBounds + "; parent=" + feedbackParentClient
+                        + "; route=" + form.routeCard.Height + "; expected=" + expectedRouteHeight + "]";
+                    return removedSelectionPreserved && newModelReported && requestSnapshotStable
+                        && customSelectionPreserved && updateDidNotMarkDraft
+                        && failurePreservesListAndSelection && feedbackLayoutValid;
+                }
+            }
+            catch (Exception ex)
+            {
+                evidence = "exception=" + ex.GetType().Name + ":" + ex.Message;
+                return false;
+            }
+        }
+
+        private static RequestModelCatalogSnapshot CreateModelCatalogFixture(params string[] slugs)
+        {
+            RequestModelCatalogSnapshot snapshot = new RequestModelCatalogSnapshot
+            {
+                RefreshedAtUtc = "2026-10-04T00:00:00.0000000Z"
+            };
+            foreach (string slug in slugs)
+            {
+                snapshot.Models.Add(new RequestModelCatalogEntry { Slug = slug, DisplayName = slug });
+            }
+            return snapshot;
+        }
+
+        internal static bool VerifyFlexiblePlanInputOrder(out string evidence)
+        {
+            try
+            {
+                using (MainForm form = new MainForm())
+                {
+                    form.StartPosition = FormStartPosition.Manual;
+                    form.ShowInTaskbar = false;
+                    form.ClientSize = new Size(960, 800);
+                    IntPtr formHandle = form.Handle;
+                    EnsureControlHandles(form);
+                    MethodInfo onLoad = typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (onLoad == null) throw new InvalidOperationException("无法触发 WinForms Load 输入路径。");
+                    onLoad.Invoke(form, new object[] { EventArgs.Empty });
+                    form.extraWakeList.Items.Clear();
+
+                    int parsedCount;
+                    bool blankRejected = !SequenceCountInput.TryParse(string.Empty, out parsedCount)
+                        && !SequenceCountInput.TryParse("   ", out parsedCount)
+                        && !SequenceCountInput.TryParse("abc", out parsedCount);
+                    bool zeroAccepted = SequenceCountInput.TryParse("0", out parsedCount) && parsedCount == 0;
+
+                    form.sequenceCountBox.Text = string.Empty;
+                    bool blankInputsEnabled = form.sequenceDatePicker.Enabled
+                        && form.sequenceTimePicker.Enabled
+                        && form.sequenceNowButton.Enabled
+                        && form.sequenceIntervalHoursBox.Enabled
+                        && form.sequenceIntervalMinutesBox.Enabled;
+                    DateTime chosenStart = new DateTime(2099, 7, 8, 9, 10, 0);
+                    form.sequenceDatePicker.Value = chosenStart.Date;
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(chosenStart.Hour).AddMinutes(chosenStart.Minute);
+                    form.sequenceIntervalHoursBox.Value = 5;
+                    form.sequenceIntervalMinutesBox.Value = 10;
+                    form.sequenceCountBox.Text = "3";
+                    AppConfig threeRunDraft = form.ReadForm(false);
+                    List<PlannedRun> threeRunPlan = SchedulePlanner.Build(threeRunDraft, DateTime.MinValue, 14);
+                    bool retainedBlankDraft = blankInputsEnabled
+                        && threeRunDraft.SequenceCount == 3
+                        && threeRunPlan.Count == 3
+                        && threeRunPlan[0].Time == chosenStart
+                        && threeRunPlan[1].Time == chosenStart.AddMinutes(310)
+                        && threeRunPlan[2].Time == chosenStart.AddMinutes(620);
+
+                    form.sequenceCountBox.Text = "temporary-invalid";
+                    bool invalidInputsEnabled = form.sequenceDatePicker.Enabled
+                        && form.sequenceTimePicker.Enabled
+                        && form.sequenceNowButton.Enabled
+                        && form.sequenceIntervalHoursBox.Enabled
+                        && form.sequenceIntervalMinutesBox.Enabled;
+                    bool invalidSaveRejected = !form.SaveMaintenanceDraft();
+                    DateTime invalidDraftStart = new DateTime(2099, 8, 9, 11, 12, 0);
+                    form.sequenceDatePicker.Value = invalidDraftStart.Date;
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(invalidDraftStart.Hour).AddMinutes(invalidDraftStart.Minute);
+                    form.sequenceIntervalHoursBox.Value = 3;
+                    form.sequenceIntervalMinutesBox.Value = 15;
+                    form.sequenceCountBox.Text = "2";
+                    AppConfig recoveredDraft = form.ReadForm(false);
+                    List<PlannedRun> recoveredPlan = SchedulePlanner.Build(recoveredDraft, DateTime.MinValue, 14);
+                    bool retainedInvalidDraft = invalidInputsEnabled
+                        && recoveredPlan.Count == 2
+                        && recoveredPlan[0].Time == invalidDraftStart
+                        && recoveredPlan[1].Time == invalidDraftStart.AddMinutes(195);
+
+                    form.sequenceCountBox.Text = "0";
+                    bool zeroInputsEnabled = form.sequenceDatePicker.Enabled
+                        && form.sequenceTimePicker.Enabled
+                        && form.sequenceNowButton.Enabled
+                        && form.sequenceIntervalHoursBox.Enabled
+                        && form.sequenceIntervalMinutesBox.Enabled;
+                    DateTime nowBefore = DateTime.Now;
+                    InvokeButtonClick(form.sequenceNowButton);
+                    DateTime nowAfter = DateTime.Now;
+                    DateTime pickedNow = form.ReadSequenceStart();
+                    bool nowUsesNextMinute = SequenceStartShortcut.IsEnabled()
+                        && pickedNow >= SequenceStartShortcut.NextMinute(nowBefore)
+                        && pickedNow <= SequenceStartShortcut.NextMinute(nowAfter);
+
+                    DateTime extraWake = new DateTime(2099, 9, 10, 10, 11, 0);
+                    form.extraWakeDatePicker.Value = extraWake.Date;
+                    form.extraWakeTimePicker.Value = DateTime.Today.AddHours(extraWake.Hour).AddMinutes(extraWake.Minute);
+                    InvokeButtonClick(form.addExtraWakeButton);
+                    AppConfig zeroWithExtra = form.ReadForm(false);
+                    List<PlannedRun> extraOnlyPlan = SchedulePlanner.Build(zeroWithExtra, DateTime.MinValue, 14);
+                    bool zeroWithExtraWorks = zeroWithExtra.SequenceCount == 0
+                        && extraOnlyPlan.Count == 1
+                        && extraOnlyPlan[0].Time == extraWake
+                        && extraOnlyPlan[0].Source == "插入唤醒";
+
+                    evidence = "blankRejected=" + blankRejected
+                        + "; zeroAccepted=" + zeroAccepted
+                        + "; blankInputsEnabled=" + blankInputsEnabled
+                        + "; blankDraftUsesEarlierValues=" + retainedBlankDraft
+                        + "; invalidInputsEnabled=" + invalidInputsEnabled
+                        + "; invalidSaveRejected=" + invalidSaveRejected
+                        + "; invalidDraftUsesEarlierValues=" + retainedInvalidDraft
+                        + "; zeroInputsEnabled=" + zeroInputsEnabled
+                        + "; nowUsesNextMinute=" + nowUsesNextMinute
+                        + "; zeroWithExtraWorks=" + zeroWithExtraWorks;
+                    return blankRejected && zeroAccepted && retainedBlankDraft
+                        && invalidSaveRejected && retainedInvalidDraft && zeroInputsEnabled
+                        && nowUsesNextMinute && zeroWithExtraWorks;
+                }
+            }
+            catch (Exception ex)
+            {
+                evidence = "exception=" + ex.GetType().Name + ":" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static bool VerifyManualTestValidationIsolation(out string evidence)
+        {
+            try
+            {
+                using (MainForm form = new MainForm())
+                {
+                    form.StartPosition = FormStartPosition.Manual;
+                    form.ShowInTaskbar = false;
+                    form.ClientSize = new Size(960, 800);
+                    IntPtr formHandle = form.Handle;
+                    EnsureControlHandles(form);
+                    MethodInfo onLoad = typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (onLoad == null) throw new InvalidOperationException("无法触发 WinForms Load 请求测试路径。");
+                    onLoad.Invoke(form, new object[] { EventArgs.Empty });
+
+                    form.modelBox.Text = "gpt-6-luna";
+                    form.promptBox.Text = "Respond with OK.";
+                    form.extraWakeList.Items.Clear();
+                    form.sequenceIntervalHoursBox.Value = 0;
+                    form.sequenceIntervalMinutesBox.Value = 1;
+                    DateTime futureStart = DateTime.Today.AddDays(2).AddHours(9);
+                    form.sequenceDatePicker.Value = futureStart.Date;
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(futureStart.Hour).AddMinutes(futureStart.Minute);
+
+                    bool invalidPlanDoesNotBlockTest = true;
+                    bool invalidPlanDoesNotMutateDraft = true;
+                    string[] invalidCounts = new[] { string.Empty, "   ", "temporary-invalid", "-1", "0" };
+                    foreach (string invalidCount in invalidCounts)
+                    {
+                        form.extraWakeList.Items.Clear();
+                        form.sequenceCountBox.Text = invalidCount;
+                        DateTime startBefore = form.ReadSequenceStart();
+                        int intervalBefore = form.ReadSequenceIntervalMinutes();
+                        bool requestAccepted = form.ValidateRequestInputs(false);
+                        bool planRejected = !form.ValidateForm(true, false);
+                        bool draftUnchanged = form.sequenceCountBox.Text == invalidCount
+                            && form.ReadSequenceStart() == startBefore
+                            && form.ReadSequenceIntervalMinutes() == intervalBefore
+                            && form.extraWakeList.Items.Count == 0;
+                        invalidPlanDoesNotBlockTest = invalidPlanDoesNotBlockTest && requestAccepted && planRejected;
+                        invalidPlanDoesNotMutateDraft = invalidPlanDoesNotMutateDraft && draftUnchanged;
+                    }
+
+                    form.sequenceCountBox.Text = "2";
+                    form.sequenceDatePicker.Value = DateTime.Today.AddDays(-2);
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(8);
+                    bool expiredStartDoesNotBlockTest = form.ValidateRequestInputs(false)
+                        && !form.ValidateForm(true, false);
+
+                    form.sequenceDatePicker.Value = futureStart.Date;
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(futureStart.Hour).AddMinutes(futureStart.Minute);
+                    form.sequenceIntervalHoursBox.Value = 0;
+                    form.sequenceIntervalMinutesBox.Value = 0;
+                    bool invalidIntervalDoesNotBlockTest = form.ValidateRequestInputs(false)
+                        && !form.ValidateForm(true, false);
+
+                    form.sequenceCountBox.Text = "0";
+                    form.extraWakeList.Items.Add("2000-01-01 00:00");
+                    bool pastExtraDoesNotBlockTest = form.ValidateRequestInputs(false)
+                        && !form.ValidateForm(true, false);
+
+                    form.extraWakeList.Items.Clear();
+                    form.sequenceCountBox.Text = "1";
+                    form.sequenceIntervalMinutesBox.Value = 0;
+                    bool completePlanAccepted = form.ValidateForm(true, false);
+                    form.modelBox.Text = " ";
+                    bool emptyModelRejected = !form.ValidateRequestInputs(false);
+                    form.modelBox.Text = "gpt-6-luna";
+                    form.promptBox.Text = " ";
+                    bool emptyPromptRejected = !form.ValidateRequestInputs(false);
+
+                    DateTime fixtureNow = DateTime.Now;
+                    RunRecord resetEvidence = new RunRecord
+                    {
+                        Success = true,
+                        HasReliableResetTime = true,
+                        ResetsAtUnix = new DateTimeOffset(fixtureNow.AddHours(3)).ToUnixTimeSeconds()
+                    };
+                    bool resetPrefillGatesInvalidCounts = true;
+                    foreach (string invalidCount in new[] { string.Empty, "invalid", "0" })
+                    {
+                        form.sequenceCountBox.Text = invalidCount;
+                        ManualTestScheduleSnapshot before = form.CaptureManualTestScheduleSnapshot();
+                        ResetScheduleAdjustment adjustment = ManualTestSchedulePolicy.EvaluateReset(
+                            resetEvidence,
+                            before,
+                            form.CaptureManualTestScheduleSnapshot(),
+                            fixtureNow);
+                        resetPrefillGatesInvalidCounts = resetPrefillGatesInvalidCounts
+                            && !adjustment.Applied
+                            && form.sequenceCountBox.Text == invalidCount
+                            && form.ReadSequenceStart() == before.SequenceStart;
+                    }
+
+                    form.sequenceCountBox.Text = "1";
+                    ManualTestScheduleSnapshot validBefore = form.CaptureManualTestScheduleSnapshot();
+                    ResetScheduleAdjustment validAdjustment = ManualTestSchedulePolicy.EvaluateReset(
+                        resetEvidence,
+                        validBefore,
+                        form.CaptureManualTestScheduleSnapshot(),
+                        fixtureNow);
+                    bool positiveCountKeepsPrefill = validAdjustment.Applied;
+
+                    ManualTestScheduleSnapshot changedBefore = form.CaptureManualTestScheduleSnapshot();
+                    DateTime changedStart = futureStart.AddDays(1);
+                    form.sequenceDatePicker.Value = changedStart.Date;
+                    form.sequenceTimePicker.Value = DateTime.Today.AddHours(changedStart.Hour).AddMinutes(changedStart.Minute);
+                    DateTime preservedStart = form.ReadSequenceStart();
+                    ResetScheduleAdjustment changedAdjustment = ManualTestSchedulePolicy.EvaluateReset(
+                        resetEvidence,
+                        changedBefore,
+                        form.CaptureManualTestScheduleSnapshot(),
+                        fixtureNow);
+                    bool concurrentDraftIsPreserved = !changedAdjustment.Applied
+                        && form.ReadSequenceStart() == preservedStart;
+
+                    evidence = "invalidPlanTestAllowed=" + invalidPlanDoesNotBlockTest
+                        + "; invalidPlanDraftUnchanged=" + invalidPlanDoesNotMutateDraft
+                        + "; expiredStartTestAllowed=" + expiredStartDoesNotBlockTest
+                        + "; invalidIntervalTestAllowed=" + invalidIntervalDoesNotBlockTest
+                        + "; pastExtraTestAllowed=" + pastExtraDoesNotBlockTest
+                        + "; completePlanAccepted=" + completePlanAccepted
+                        + "; emptyModelRejected=" + emptyModelRejected
+                        + "; emptyPromptRejected=" + emptyPromptRejected
+                        + "; invalidCountPrefillBlocked=" + resetPrefillGatesInvalidCounts
+                        + "; positiveCountPrefillPreserved=" + positiveCountKeepsPrefill
+                        + "; concurrentDraftPreserved=" + concurrentDraftIsPreserved;
+                    return invalidPlanDoesNotBlockTest && invalidPlanDoesNotMutateDraft
+                        && expiredStartDoesNotBlockTest && invalidIntervalDoesNotBlockTest
+                        && pastExtraDoesNotBlockTest && completePlanAccepted
+                        && emptyModelRejected && emptyPromptRejected
+                        && resetPrefillGatesInvalidCounts && positiveCountKeepsPrefill
+                        && concurrentDraftIsPreserved;
+                }
+            }
+            catch (Exception ex)
+            {
+                evidence = "exception=" + ex.GetType().Name + ":" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static bool VerifyResultPlanNavigation(out string evidence)
+        {
+            using (MainForm form = new MainForm())
+            {
+                IntPtr handle = form.Handle;
+                EnsureControlHandles(form);
+                MethodInfo load = typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+                load.Invoke(form, new object[] { EventArgs.Empty });
+                ManualTestScheduleSnapshot before = form.CaptureManualTestScheduleSnapshot();
+                string modelBefore = form.modelBox.Text;
+                string promptBefore = form.promptBox.Text;
+                string configBefore = JsonStore.Serialize(form.config);
+                bool dirtyBefore = form.hasUnsavedChanges;
+                form.NavigateToPlan();
+                ManualTestScheduleSnapshot after = form.CaptureManualTestScheduleSnapshot();
+                bool unchanged = JsonStore.Serialize(before) == JsonStore.Serialize(after) && modelBefore == form.modelBox.Text
+                    && promptBefore == form.promptBox.Text && configBefore == JsonStore.Serialize(form.config)
+                    && dirtyBefore == form.hasUnsavedChanges;
+                bool reachable = form.viewport.ClientRectangle.IntersectsWith(BoundsInAncestor(form.sequenceDatePicker, form.viewport));
+                evidence = "draftAndConfigUnchanged=" + unchanged + "; planReachable=" + reachable;
+                return unchanged && reachable;
+            }
+        }
+
+        private static void InvokeButtonClick(Button button)
+        {
+            MethodInfo onClick = typeof(Button).GetMethod("OnClick", BindingFlags.Instance | BindingFlags.NonPublic);
+            if (onClick == null) throw new InvalidOperationException("无法触发 WinForms Button.Click 事件。");
+            onClick.Invoke(button, new object[] { EventArgs.Empty });
+        }
+
+        private static bool VerifyLayoutScenario(int clientWidth, int clientHeight, float scale, bool expectTwoColumns, out string evidence)
+        {
+            using (MainForm form = new MainForm())
+            {
+                form.StartPosition = FormStartPosition.Manual;
+                form.ShowInTaskbar = false;
+                if (Math.Abs(scale - 1F) > 0.001F)
+                {
+                    form.Scale(new SizeF(scale, scale));
+                    form.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                }
+                form.ClientSize = new Size(clientWidth, clientHeight);
+                IntPtr formHandle = form.Handle;
+                EnsureControlHandles(form);
+                MethodInfo onLoad = typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (onLoad == null) throw new InvalidOperationException("无法触发 WinForms Load 布局路径。");
+                onLoad.Invoke(form, new object[] { EventArgs.Empty });
+                form.LayoutResponsive();
+                PerformLayoutTree(form);
+                form.LayoutResponsive();
+                PerformLayoutTree(form);
+
+                int available = Math.Max(300, form.viewport.ClientSize.Width - form.pageRoot.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth);
+                Rectangle inputInViewport = BoundsInAncestor(form.sequenceDatePicker, form.viewport);
+                Rectangle saveInSchedule = BoundsInAncestor(form.saveButton, form.sequenceSchedulePanel);
+                Rectangle timelineInViewport = BoundsInAncestor(form.timelineList, form.viewport);
+                string cardRegionEvidence;
+                bool cardRegionsSeparated = VerifyCardRegions(form, out cardRegionEvidence);
+                Rectangle initialViewport = form.viewport.ClientRectangle;
+                Rectangle heroInViewport = BoundsInAncestor(form.pageRoot.Controls[1], form.viewport);
+                Rectangle scheduleInViewport = BoundsInAncestor(form.leftStack.Controls[0], form.viewport);
+                Panel scheduleCard = form.leftStack.Controls.Count > 0 ? form.leftStack.Controls[0] as Panel : null;
+                SplitContainer dataSplit = form.rightStack.Controls.Count > 0 ? form.rightStack.Controls[0] as SplitContainer : null;
+
+                bool mode = form.mainGrid.ColumnCount == (expectTwoColumns ? 2 : 1)
+                    && form.leftStack.Width > 0 && form.rightStack.Width > 0;
+                bool contentGeometry = form.pageRoot.Width > 0 && form.pageRoot.Height > 0
+                    && form.mainGrid.Width > 0 && form.mainGrid.Height > 0
+                    && form.leftStack.Height > 0 && form.rightStack.Height > 0
+                    && scheduleCard != null && scheduleCard.Width > 0 && scheduleCard.Height > 0
+                    && form.sequenceDatePicker.Width > 0 && form.sequenceDatePicker.Height > 0
+                    && form.saveButton.Width > 0 && form.saveButton.Height > 0
+                    && form.timelineList.Width > 0 && form.timelineList.Height > 0;
+                bool inputInParent = form.sequenceDatePicker.Parent.ClientRectangle.Contains(form.sequenceDatePicker.Bounds);
+                bool saveInParent = form.saveButton.Parent.ClientRectangle.Contains(form.saveButton.Bounds);
+                bool scheduleInParent = scheduleCard != null && form.leftStack.ClientRectangle.Contains(scheduleCard.Bounds);
+                bool timelineInParent = form.timelineList.Parent.ClientRectangle.Contains(form.timelineList.Bounds);
+                bool routeInParent = form.routeTestButton.Parent.ClientRectangle.Contains(form.routeTestButton.Bounds);
+                bool scheduleCardOnFirstScreen = initialViewport.IntersectsWith(scheduleInViewport)
+                    && scheduleInViewport.Top >= heroInViewport.Bottom;
+                bool inputOnFirstScreen = initialViewport.IntersectsWith(inputInViewport)
+                    && inputInViewport.Top >= heroInViewport.Bottom;
+                bool splitGeometry = dataSplit != null
+                    && dataSplit.Panel1.ClientSize.Width > 0 && dataSplit.Panel1.ClientSize.Height >= dataSplit.Panel1MinSize
+                    && dataSplit.Panel2.ClientSize.Width > 0 && dataSplit.Panel2.ClientSize.Height >= dataSplit.Panel2MinSize;
+
+                int advancedHeight = form.leftStack.Controls[1].Height;
+                form.ToggleAdvancedSettings();
+                PerformLayoutTree(form);
+                bool advancedExpands = form.advancedExpanded && form.leftStack.Controls[1].Height > advancedHeight
+                    && form.advancedBody.Height > 0;
+                bool advancedFieldsReachable = advancedExpands
+                    && ScrollIntoView(form.modelBox, form.viewport)
+                    && ScrollIntoView(form.retryBox, form.viewport)
+                    && ScrollIntoView(form.runWithoutLogonCheck, form.viewport)
+                    && ScrollIntoView(form.autoSleepCheck, form.viewport)
+                    && ScrollIntoView(form.promptBox, form.viewport);
+                form.ToggleAdvancedSettings();
+                PerformLayoutTree(form);
+                bool advancedCollapses = !form.advancedExpanded && form.leftStack.Controls[1].Height == advancedHeight;
+
+                int routeHeight = form.leftStack.Controls[2].Height;
+                form.ToggleRouteDetails();
+                PerformLayoutTree(form);
+                bool routeExpands = form.routeDetailsExpanded && form.leftStack.Controls[2].Height > routeHeight;
+                form.ToggleRouteDetails();
+                PerformLayoutTree(form);
+                bool routeCollapses = !form.routeDetailsExpanded && form.leftStack.Controls[2].Height == routeHeight;
+
+                int installedHeight = form.rightStack.Controls[1].Height;
+                form.ToggleInstalledDetails();
+                PerformLayoutTree(form);
+                bool installedExpands = form.installedDetailsExpanded && form.rightStack.Controls[1].Height > installedHeight;
+                form.ToggleInstalledDetails();
+                PerformLayoutTree(form);
+                bool installedCollapses = !form.installedDetailsExpanded && form.rightStack.Controls[1].Height == installedHeight;
+
+                form.ToggleResultDetails();
+                bool resultExpands = form.resultDetailsExpanded && form.resultDetailsButton.Text == "收起执行详情";
+                form.ToggleResultDetails();
+                bool resultCollapses = !form.resultDetailsExpanded && form.resultDetailsButton.Text == "查看执行详情";
+
+                form.sequenceSchedulePanel.ScrollControlIntoView(form.saveButton);
+                PerformLayoutTree(form);
+                Rectangle saveAfterScroll = BoundsInAncestor(form.saveButton, form.sequenceSchedulePanel);
+                bool saveReachable = form.sequenceSchedulePanel.AutoScroll
+                    && form.sequenceSchedulePanel.ClientRectangle.IntersectsWith(saveAfterScroll);
+
+                form.viewport.ScrollControlIntoView(form.timelineList);
+                PerformLayoutTree(form);
+                Rectangle timelineAfterScroll = BoundsInAncestor(form.timelineList, form.viewport);
+                bool timelineReachable = form.viewport.AutoScroll && form.viewport.ClientRectangle.IntersectsWith(timelineAfterScroll);
+                form.viewport.ScrollControlIntoView(form.routeTestButton);
+                PerformLayoutTree(form);
+                Rectangle routeAfterScroll = BoundsInAncestor(form.routeTestButton, form.viewport);
+                bool routeReachable = form.viewport.AutoScroll && form.viewport.ClientRectangle.IntersectsWith(routeAfterScroll);
+
+                Control[] actions = new Control[]
+                {
+                    form.sequenceDatePicker,
+                    form.sequenceTimePicker,
+                    form.sequenceNowButton,
+                    form.sequenceIntervalHoursBox,
+                    form.sequenceIntervalMinutesBox,
+                    form.sequenceCountBox,
+                    form.extraWakeDatePicker,
+                    form.extraWakeTimePicker,
+                    form.addExtraWakeButton,
+                    form.removeExtraWakeButton,
+                    form.saveButton,
+                    form.pauseButton,
+                    form.routeTestButton,
+                    form.routeRefreshButton,
+                    form.routeDetailsButton,
+                    form.advancedToggleButton,
+                    form.installedDetailsButton,
+                    form.resultDetailsButton,
+                    form.openLogButton,
+                    form.deleteTaskButton
+                };
+                int reachableActions = 0;
+                string unreachableActions = "";
+                foreach (Control action in actions)
+                {
+                    string actionEvidence;
+                    if (ScrollIntoView(action, form.viewport, out actionEvidence))
+                    {
+                        reachableActions++;
+                    }
+                    else
+                    {
+                        if (unreachableActions.Length > 0) unreachableActions += ",";
+                        unreachableActions += actionEvidence;
+                    }
+                }
+                bool allActionsReachable = reachableActions == actions.Length;
+
+                evidence = "client=" + clientWidth + "x" + clientHeight + ",scale=" + scale.ToString("0.00", CultureInfo.InvariantCulture)
+                    + ",available=" + available + ",columns=" + form.mainGrid.ColumnCount
+                    + ",viewport=" + FormatBounds(form.viewport.ClientRectangle)
+                    + ",pageRoot=" + FormatBounds(form.pageRoot.Bounds)
+                    + ",mainGrid=" + FormatBounds(form.mainGrid.Bounds)
+                    + ",leftStack=" + FormatBounds(form.leftStack.Bounds)
+                    + ",rightStack=" + FormatBounds(form.rightStack.Bounds)
+                    + ",hero=" + FormatBounds(heroInViewport)
+                    + ",scheduleCard=" + FormatBounds(scheduleInViewport)
+                    + ",input=" + FormatBounds(inputInViewport)
+                    + ",save=" + FormatBounds(saveInSchedule)
+                    + ",timeline=" + FormatBounds(timelineInViewport)
+                    + ",cardRegions=" + cardRegionsSeparated + "[" + cardRegionEvidence + "]"
+                    + ",scheduleCardFirstScreen=" + scheduleCardOnFirstScreen
+                    + ",inputFirstScreen=" + inputOnFirstScreen
+                    + ",saveReachable=" + saveReachable
+                    + ",timelineAfterScroll=" + FormatBounds(timelineAfterScroll)
+                    + ",timelineReachable=" + timelineReachable
+                    + ",routeAfterScroll=" + FormatBounds(routeAfterScroll)
+                    + ",routeReachable=" + routeReachable
+                    + ",actions=" + reachableActions + "/" + actions.Length
+                    + (unreachableActions.Length == 0 ? "" : ",unreachable=" + unreachableActions)
+                    + ",viewportScroll=" + FormatBounds(form.viewport.AutoScrollPosition == Point.Empty
+                        ? Rectangle.Empty
+                        : new Rectangle(form.viewport.AutoScrollPosition, Size.Empty))
+                    + ",checks=" + mode + "/" + contentGeometry + "/" + scheduleInParent + "/" + inputInParent + "/" + saveInParent + "/" + timelineInParent + "/" + routeInParent + "/" + splitGeometry
+                    + "/advanced=" + advancedExpands + ":" + advancedCollapses
+                    + ":fields=" + advancedFieldsReachable
+                    + "/route=" + routeExpands + ":" + routeCollapses
+                    + "/installed=" + installedExpands + ":" + installedCollapses
+                    + "/result=" + resultExpands + ":" + resultCollapses;
+
+                return mode && contentGeometry && cardRegionsSeparated && scheduleInParent && inputInParent && saveInParent && timelineInParent && routeInParent
+                    && scheduleCardOnFirstScreen && inputOnFirstScreen && splitGeometry
+                    && advancedExpands && advancedFieldsReachable && advancedCollapses && routeExpands && routeCollapses
+                    && installedExpands && installedCollapses && resultExpands && resultCollapses
+                    && saveReachable && timelineReachable && routeReachable && allActionsReachable;
+            }
+        }
+
+        private static bool VerifyCardRegions(MainForm form, out string evidence)
+        {
+            List<Control> cards = new List<Control>();
+            foreach (Control card in form.leftStack.Controls) cards.Add(card);
+            SplitContainer split = form.rightStack.Controls.Count > 0 ? form.rightStack.Controls[0] as SplitContainer : null;
+            if (split != null)
+            {
+                if (split.Panel1.Controls.Count > 0) cards.Add(split.Panel1.Controls[0]);
+                if (split.Panel2.Controls.Count > 0) cards.Add(split.Panel2.Controls[0]);
+            }
+            if (form.rightStack.Controls.Count > 1) cards.Add(form.rightStack.Controls[1]);
+
+            bool allSeparated = cards.Count == 6;
+            List<string> regions = new List<string>();
+            foreach (Control card in cards)
+            {
+                TableLayoutPanel explicitLayout = card.Controls.OfType<TableLayoutPanel>().FirstOrDefault();
+                Control header;
+                Control body;
+                if (explicitLayout != null)
+                {
+                    header = explicitLayout.GetControlFromPosition(0, 0);
+                    body = explicitLayout.GetControlFromPosition(0, 1);
                 }
                 else
                 {
-                    runWithoutLogonCheck.AccessibleName = "未选择；普通睡眠唤醒不受影响，Windows 更新重启后可能漏跑";
+                    header = card.Controls.OfType<Label>().FirstOrDefault();
+                    body = card.Controls.OfType<Panel>().FirstOrDefault();
                 }
-            };
-            options.SetColumnSpan(runWithoutLogonCheck, 4);
-            options.Controls.Add(runWithoutLogonCheck, 0, 1);
 
-            Label runWithoutLogonHint = NewLabel("普通睡眠唤醒不需要；开启后保存时需输入当前 Windows 帐户密码，开机 PIN、指纹和人脸不可用。");
-            runWithoutLogonHint.ForeColor = Color.FromArgb(100, 104, 112);
-            runWithoutLogonHint.MaximumSize = new Size(780, 0);
-            runWithoutLogonHint.Margin = new Padding(0, 3, 0, 0);
-            options.SetColumnSpan(runWithoutLogonHint, 4);
-            options.Controls.Add(runWithoutLogonHint, 0, 2);
-
-            autoSleepCheck = new CheckBox();
-            autoSleepCheck.Text = "任务唤醒电脑后，成功完成时自动睡眠";
-            autoSleepCheck.AutoSize = true;
-            autoSleepCheck.Margin = new Padding(0, 9, 0, 0);
-            options.SetColumnSpan(autoSleepCheck, 4);
-            options.Controls.Add(autoSleepCheck, 0, 3);
-
-            Label executionHint = NewLabel("执行期间防睡眠与超时：程序自动管理；成功会提前结束，失败后交回 Windows 电源策略。");
-            executionHint.ForeColor = Color.FromArgb(100, 104, 112);
-            executionHint.Margin = new Padding(0, 6, 0, 0);
-            options.SetColumnSpan(executionHint, 4);
-            options.Controls.Add(executionHint, 0, 4);
-
-            GroupBox promptGroup = NewGroup("触发消息");
-            promptGroup.Height = 90;
-            promptGroup.Dock = DockStyle.Top;
-            promptGroup.Margin = new Padding(0, 4, 0, 12);
-            root.Controls.Add(promptGroup, 0, 5);
-            promptBox = new TextBox();
-            promptBox.Multiline = true;
-            promptBox.Dock = DockStyle.Fill;
-            promptBox.Margin = new Padding(12);
-            promptBox.ScrollBars = ScrollBars.Vertical;
-            promptBox.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
-            promptGroup.Padding = new Padding(12);
-            promptGroup.Controls.Add(promptBox);
-
-            FlowLayoutPanel mainActions = new FlowLayoutPanel();
-            mainActions.AutoSize = true;
-            mainActions.WrapContents = true;
-            mainActions.Margin = new Padding(0, 0, 0, 12);
-            root.Controls.Add(mainActions, 0, 6);
-
-            saveButton = NewButton("保存并启用", true);
-            saveButton.Click += delegate { SaveAndEnable(); };
-            mainActions.Controls.Add(saveButton);
-            pauseButton = NewButton("暂停计划", false);
-            pauseButton.Click += delegate { PauseSchedule(); };
-            mainActions.Controls.Add(pauseButton);
-            deleteTaskButton = NewButton("删除计划", false);
-            deleteTaskButton.Click += delegate { DeleteSchedule(); };
-            mainActions.Controls.Add(deleteTaskButton);
-            Button openLog = NewButton("打开日志", false);
-            openLog.Click += delegate { OpenLog(); };
-            mainActions.Controls.Add(openLog);
-
-            GroupBox timelineGroup = NewGroup("当前执行序列");
-            timelineGroup.Dock = DockStyle.Fill;
-            Panel timelinePanel = new Panel();
-            timelinePanel.Dock = DockStyle.Fill;
-            timelinePanel.Padding = new Padding(8, 6, 8, 6);
-            timelineGroup.Controls.Add(timelinePanel);
-            timelineSummaryLabel = new Label();
-            timelineSummaryLabel.Dock = DockStyle.Top;
-            timelineSummaryLabel.Height = 24;
-            timelineSummaryLabel.ForeColor = Color.FromArgb(80, 84, 92);
-            timelinePanel.Controls.Add(timelineSummaryLabel);
-            timelineList = new ListView();
-            timelineList.Dock = DockStyle.Fill;
-            timelineList.View = View.Details;
-            timelineList.FullRowSelect = true;
-            timelineList.GridLines = true;
-            timelineList.HeaderStyle = ColumnHeaderStyle.Nonclickable;
-            timelineList.Columns.Add("状态", 88);
-            timelineList.Columns.Add("触发时间", 165);
-            timelineList.Columns.Add("来源", 360);
-            timelineList.Resize += delegate { ResizeTimelineColumns(); };
-            timelinePanel.Controls.Add(timelineList);
-
-            GroupBox resultGroup = NewGroup("最近一次结果");
-            resultGroup.Dock = DockStyle.Fill;
-            resultBox = new TextBox();
-            resultBox.Multiline = true;
-            resultBox.ReadOnly = true;
-            resultBox.ScrollBars = ScrollBars.Both;
-            resultBox.Dock = DockStyle.Fill;
-            resultBox.BackColor = Color.White;
-            resultBox.Font = new Font("Consolas", 9F);
-            resultGroup.Padding = new Padding(12);
-            resultGroup.Controls.Add(resultBox);
-
-            SplitContainer dataSplit = new SplitContainer();
-            dataSplit.Dock = DockStyle.Fill;
-            dataSplit.Orientation = Orientation.Horizontal;
-            dataSplit.IsSplitterFixed = false;
-            dataSplit.SplitterWidth = 8;
-            dataSplit.SplitterDistance = 210;
-            dataSplit.Panel1MinSize = 110;
-            dataSplit.Panel2MinSize = 80;
-            dataSplit.Margin = new Padding(0, 0, 0, 10);
-            dataSplit.Panel1.Controls.Add(timelineGroup);
-            dataSplit.Panel2.Controls.Add(resultGroup);
-            root.Controls.Add(dataSplit, 0, 7);
-
-            Label footer = new Label();
-            footer.Text = "后台请求使用 read-only 沙盒并验证本次链路；程序不会读取或保存 ChatGPT 凭据。";
-            footer.AutoSize = true;
-            footer.ForeColor = Color.FromArgb(100, 104, 112);
-            footer.Margin = new Padding(0, 12, 0, 0);
-            root.Controls.Add(footer, 0, 8);
-
-            Load += delegate { LoadState(); };
+                Control firstContent = body == null ? null : body.Controls.Cast<Control>()
+                    .Where(child => child.Width > 0 && child.Height > 0)
+                    .OrderBy(child => child.Top)
+                    .FirstOrDefault();
+                Rectangle headerInCard = header == null ? Rectangle.Empty : BoundsInAncestor(header, card);
+                Rectangle bodyInCard = body == null ? Rectangle.Empty : BoundsInAncestor(body, card);
+                Rectangle firstContentInCard = firstContent == null ? Rectangle.Empty : BoundsInAncestor(firstContent, card);
+                bool separated = header != null && body != null && firstContent != null
+                    && header.Width > 0 && body.Width > 0 && firstContent.Width > 0 && firstContent.Height > 0
+                    && !headerInCard.IntersectsWith(bodyInCard)
+                    && bodyInCard.Top >= headerInCard.Bottom
+                    && firstContentInCard.Top >= headerInCard.Bottom;
+                allSeparated = allSeparated && separated;
+                string title = header is Label ? ((Label)header).Text : "?";
+                regions.Add(title + ":h=" + (header == null ? "missing" : FormatBounds(headerInCard))
+                    + ",b=" + (body == null ? "missing" : FormatBounds(bodyInCard))
+                    + ",first=" + (firstContent == null ? "missing" : FormatBounds(firstContentInCard))
+                    + ",ok=" + separated);
+            }
+            evidence = string.Join("|", regions.ToArray());
+            return allSeparated;
         }
 
-        private static GroupBox NewGroup(string title)
+        private static void EnsureControlHandles(Control parent)
         {
-            GroupBox group = new GroupBox();
-            group.Text = title;
-            group.Dock = DockStyle.Fill;
-            group.BackColor = Color.White;
-            group.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
-            return group;
+            foreach (Control child in parent.Controls)
+            {
+                IntPtr childHandle = child.Handle;
+                EnsureControlHandles(child);
+            }
+        }
+
+        private static void PerformLayoutTree(Control parent)
+        {
+            foreach (Control child in parent.Controls)
+            {
+                PerformLayoutTree(child);
+            }
+            parent.PerformLayout();
+        }
+
+        private static bool ScrollIntoView(Control control, Panel viewport)
+        {
+            string evidence;
+            return ScrollIntoView(control, viewport, out evidence);
+        }
+
+        private static bool ScrollIntoView(Control control, Panel viewport, out string evidence)
+        {
+            Control parent = control.Parent;
+            while (parent != null && parent != viewport)
+            {
+                ScrollableControl scrollable = parent as ScrollableControl;
+                if (scrollable != null && scrollable.AutoScroll) scrollable.ScrollControlIntoView(control);
+                parent = parent.Parent;
+            }
+            if (parent == null) throw new InvalidOperationException("操作控件不在主视口内：" + control.GetType().Name);
+            viewport.ScrollControlIntoView(control);
+            PerformLayoutTree(viewport);
+            Rectangle bounds = BoundsInAncestor(control, viewport);
+            bool parentContains = control.Width > 0 && control.Height > 0
+                && control.Parent.ClientRectangle.Contains(control.Bounds);
+            evidence = (control is Button ? ((Button)control).Text : control.GetType().Name) + "=" + FormatBounds(bounds);
+            return parentContains && viewport.ClientRectangle.IntersectsWith(bounds);
+        }
+
+        private static Rectangle BoundsInAncestor(Control control, Control ancestor)
+        {
+            Rectangle bounds = control.Bounds;
+            Control parent = control.Parent;
+            while (parent != null && parent != ancestor)
+            {
+                // WinForms updates child Bounds when an AutoScrollPosition changes; applying
+                // the scroll offset again would double-count it after ScrollControlIntoView.
+                bounds.Offset(parent.Left, parent.Top);
+                parent = parent.Parent;
+            }
+            if (parent == null)
+            {
+                throw new InvalidOperationException("控件不在目标父容器内：" + control.Name);
+            }
+            return bounds;
+        }
+
+        private static string FormatBounds(Rectangle bounds)
+        {
+            return bounds.X + "," + bounds.Y + "," + bounds.Width + "x" + bounds.Height;
+        }
+
+        private static void StyleInputs(Control parent)
+        {
+            foreach (Control control in parent.Controls)
+            {
+                if (control is TextBox) ((TextBox)control).BorderStyle = BorderStyle.FixedSingle;
+                if (control is NumericUpDown) ((NumericUpDown)control).BorderStyle = BorderStyle.FixedSingle;
+                if (control is ListBox) ((ListBox)control).BorderStyle = BorderStyle.FixedSingle;
+                if (control is TextBox || control is NumericUpDown || control is ComboBox || control is DateTimePicker)
+                    control.Margin = new Padding(0, 5, 12, 7);
+                StyleInputs(control);
+            }
         }
 
         private static Label NewLabel(string text)
@@ -4213,8 +6235,12 @@ namespace CodexQuotaWaker
             {
                 return;
             }
-            int sourceWidth = timelineList.ClientSize.Width - 88 - 165 - SystemInformation.VerticalScrollBarWidth - 8;
-            timelineList.Columns[2].Width = Math.Max(180, sourceWidth);
+            int available = timelineList.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 8;
+            int statusWidth = Math.Min(78, Math.Max(58, available / 5));
+            int timeWidth = Math.Min(152, Math.Max(112, available / 3));
+            timelineList.Columns[0].Width = statusWidth;
+            timelineList.Columns[1].Width = timeWidth;
+            timelineList.Columns[2].Width = Math.Max(72, available - statusWidth - timeWidth);
         }
 
         private static Button NewButton(string text, bool primary)
@@ -4222,20 +6248,25 @@ namespace CodexQuotaWaker
             Button button = new Button();
             button.Text = text;
             button.AutoSize = true;
-            button.MinimumSize = new Size(105, 34);
+            button.MinimumSize = new Size(105, 38);
+            button.Padding = new Padding(12, 3, 12, 3);
+            button.Cursor = Cursors.Hand;
             button.FlatStyle = FlatStyle.Flat;
             button.Margin = new Padding(0, 0, 8, 0);
             if (primary)
             {
-                button.BackColor = Color.FromArgb(42, 105, 210);
+                button.BackColor = Purple;
                 button.ForeColor = Color.White;
-                button.FlatAppearance.BorderColor = Color.FromArgb(42, 105, 210);
+                button.FlatAppearance.BorderColor = Purple;
+                button.FlatAppearance.MouseOverBackColor = Color.FromArgb(101, 80, 197);
+                button.FlatAppearance.MouseDownBackColor = Color.FromArgb(87, 69, 174);
             }
             else
             {
                 button.BackColor = Color.White;
                 button.ForeColor = Color.FromArgb(35, 38, 44);
-                button.FlatAppearance.BorderColor = Color.FromArgb(190, 194, 202);
+                button.FlatAppearance.BorderColor = Color.FromArgb(220, 225, 233);
+                button.FlatAppearance.MouseOverBackColor = Color.FromArgb(239, 244, 255);
             }
             return button;
         }
@@ -4243,6 +6274,9 @@ namespace CodexQuotaWaker
         private void LoadState()
         {
             config = JsonStore.LoadConfig();
+            legacyDefaultModelMigrationPending = AppConfig.MigrateLegacyDefaultModelToDraft(config);
+            modelCatalogSnapshot = RequestModelCatalogService.LoadOrFallback(AppPaths.ModelCatalogPath);
+            ReplaceModelCatalogChoices(modelCatalogSnapshot.Models);
             modelBox.Text = config.Model;
             promptBox.Text = config.Prompt;
             retryBox.Value = Math.Min(retryBox.Maximum, Math.Max(retryBox.Minimum, config.RetryCount));
@@ -4273,6 +6307,7 @@ namespace CodexQuotaWaker
                 extraWakeList.Items.Add(value);
             }
             UpdateSequenceSummary();
+            hasUnsavedChanges = legacyDefaultModelMigrationPending;
             RefreshStatus();
         }
 
@@ -4330,47 +6365,60 @@ namespace CodexQuotaWaker
             RefreshRouteStatus();
             WindowsTaskStatus taskStatus = WindowsTaskService.GetStatus();
             DateTime now = DateTime.Now;
-            DateTime? next = SchedulePlanner.NextRun(config, now);
             RunRecord last = JsonStore.LoadLastRun();
-            if (taskStatus.Exists && taskStatus.Enabled && next.HasValue)
+            installedTaskExists = taskStatus.Exists;
+            installedTaskEnabled = taskStatus.Exists && taskStatus.Enabled;
+            installedNextRunTime = taskStatus.NextRunTime;
+
+            if (taskStatus.Exists && taskStatus.Enabled)
             {
-                statusLabel.Text = taskStatus.CanRunWithoutLogon
-                    ? "已启用 · 无需登录也可运行，Windows 会按计划尝试唤醒电脑"
-                    : "已启用 · 需要登录 Windows 才能运行";
-                statusLabel.ForeColor = Color.FromArgb(28, 125, 80);
-                planDetailLabel.Text = DescribeInstalledPlan(next, taskStatus, last);
-            }
-            else if (taskStatus.Exists && taskStatus.Enabled)
-            {
-                statusLabel.Text = config.LegacyDailyScheduleDetected
-                    ? "已启用 · 检测到旧版每日计划，等待你更新"
-                    : taskStatus.CanRunWithoutLogon
-                        ? "已启用 · 无需登录也可运行，但当前没有待执行时间"
-                        : "已启用 · 需要登录 Windows 才能运行，但当前没有待执行时间";
-                statusLabel.ForeColor = Color.FromArgb(160, 100, 20);
-                planDetailLabel.Text = DescribeInstalledPlan(null, taskStatus, last)
-                    + "\r\n当前没有可计算的下一次触发；请检查计划后点击“更新并启用”。";
+                statusLabel.Text = "●  Windows 计划已启用";
+                statusLabel.ForeColor = taskStatus.WakeToRun ? Color.FromArgb(51, 149, 119) : Color.FromArgb(174, 119, 35);
+                statusLabel.BackColor = taskStatus.WakeToRun ? Color.FromArgb(237, 248, 242) : Color.FromArgb(250, 244, 230);
             }
             else if (taskStatus.Exists)
             {
-                statusLabel.Text = "已暂停 · Windows 不会自动执行";
-                statusLabel.ForeColor = Color.FromArgb(160, 100, 20);
-                planDetailLabel.Text = "任务名：" + TaskXml.TaskName + "（唯一一条）\r\n点击“更新并启用”会覆盖更新这条任务，不会新增第二条。";
+                statusLabel.Text = "●  Windows 计划已暂停";
+                statusLabel.ForeColor = Color.FromArgb(174, 119, 35);
+                statusLabel.BackColor = Color.FromArgb(250, 244, 230);
             }
             else
             {
-                statusLabel.Text = "未启用 · Windows 中没有本程序的计划任务";
-                statusLabel.ForeColor = Color.FromArgb(80, 84, 92);
-                planDetailLabel.Text = "先确认计划内容，再点击“保存并启用”。程序只会创建一条 " + TaskXml.TaskName + "。";
+                statusLabel.Text = "●  尚未安装计划";
+                statusLabel.ForeColor = Muted;
+                statusLabel.BackColor = Color.FromArgb(239, 236, 245);
             }
 
-            saveButton.Text = taskStatus.Exists ? "更新并启用" : "保存并启用";
-            UpdateTimeline(now);
+            installedSummaryLabel.Text = taskStatus.Exists
+                ? (taskStatus.Enabled ? "计划已存在 · 已启用" : "计划已存在 · 已暂停")
+                    + "\r\n" + (taskStatus.WakeToRun ? "允许唤醒电脑" : "未确认允许唤醒")
+                    + " · " + (taskStatus.CanRunWithoutLogon ? "无需登录" : "需要登录 Windows")
+                    + "\r\nWindows 下次运行：" + FormatTaskTime(taskStatus.NextRunTime)
+                    + "\r\nWindows 上次运行：" + FormatTaskTime(taskStatus.LastRunTime)
+                : "Windows 中尚无本程序的计划任务。保存后只会管理一条 " + TaskXml.TaskName + "。";
+            planDetailLabel.Text = taskStatus.Exists
+                ? DescribeInstalledPlan(taskStatus.NextRunTime, taskStatus, last)
+                    + (string.IsNullOrWhiteSpace(taskStatus.RuntimeDetailsError) ? string.Empty : "\r\n" + taskStatus.RuntimeDetailsError)
+                : "任务名：" + TaskXml.TaskName + "\r\n" + (string.IsNullOrWhiteSpace(taskStatus.Error)
+                    ? "修改后点击“保存并启用计划”会安装此计划。"
+                    : taskStatus.Error + "\r\n请检查 Windows 任务计划程序权限后重试。");
+            installedDetailsButton.Enabled = true;
+            saveButton.Text = taskStatus.Exists ? "更新并启用计划  ↗" : "保存并启用计划  ↗";
+            if (hasUnsavedChanges) UpdateDraftTimeline(now);
+            else UpdateTimeline(now);
             if (last == null)
             {
+                resultSummaryLabel.Text = "尚未执行请求。点击“测试请求”后，这里会显示链路状态和最终模型。";
+                resultDetailsButton.Enabled = false;
                 resultBox.Text = "暂无运行记录。";
                 return;
             }
+            resultDetailsButton.Enabled = true;
+            resultSummaryLabel.ForeColor = last.Success ? Color.FromArgb(28, 125, 80) : Color.FromArgb(180, 55, 55);
+            resultSummaryLabel.Text = RouteTestPresentation.LinkStatus(last) + "  ·  " + FormatIso(last.FinishedAt)
+                + "\r\n" + RouteTestPresentation.FinalModelLabel(last)
+                + "\r\n实际链路：" + RouteTestPresentation.RouteSummary(last)
+                + (last.Success ? string.Empty : "\r\n下一步：" + RouteTestPresentation.FailureNextStep(last));
             StringBuilder result = new StringBuilder();
             result.AppendLine("请求状态：" + RouteTestPresentation.LinkStatus(last));
             result.AppendLine("模式：" + last.Mode);
@@ -4430,6 +6478,10 @@ namespace CodexQuotaWaker
         {
             StringBuilder detail = new StringBuilder();
             detail.Append("任务名：").Append(TaskXml.TaskName).Append("（唯一一条）");
+            detail.Append("\r\n任务计划程序实际状态：").Append(taskStatus.Enabled ? "已启用" : "已暂停");
+            detail.Append("；允许唤醒：").Append(taskStatus.WakeToRun ? "是" : "否");
+            detail.Append("；Windows 下次运行：").Append(FormatTaskTime(taskStatus.NextRunTime));
+            detail.Append("；Windows 上次运行：").Append(FormatTaskTime(taskStatus.LastRunTime));
             detail.Append("\r\n计划：");
             detail.Append("序列 ").Append(config.SequenceCount).Append(" 次");
             if (config.SequenceCount > 1)
@@ -4484,6 +6536,7 @@ namespace CodexQuotaWaker
 
         private void UpdateDraftTimeline(DateTime now)
         {
+            hasUnsavedChanges = true;
             UpdateTimeline(now, ReadForm(config != null && config.Enabled), true);
         }
 
@@ -4495,6 +6548,19 @@ namespace CodexQuotaWaker
             }
 
             List<PlannedRun> plan = SchedulePlanner.Build(preview, now, 14);
+            PlannedRun heroNext = plan.FirstOrDefault(delegate(PlannedRun item) { return item.Time > now; });
+            DateTime? displayNext = draft ? (heroNext == null ? (DateTime?)null : heroNext.Time)
+                : installedTaskExists && installedTaskEnabled ? installedNextRunTime
+                : heroNext == null ? (DateTime?)null : heroNext.Time;
+            nextRunLabel.Text = displayNext.HasValue ? displayNext.Value.ToString("HH:mm")
+                : installedTaskExists && installedTaskEnabled ? "待 Windows 确认" : "尚未安排";
+            nextRunDateLabel.Text = displayNext.HasValue ? displayNext.Value.ToString("yyyy年MM月dd日 · dddd") : string.Empty;
+            heroHintLabel.Text = draft
+                ? DraftHint()
+                : installedTaskExists && installedTaskEnabled
+                    ? (installedNextRunTime.HasValue ? "这是 Windows 已安装计划的实际下次运行时间。" : "Windows 尚未提供实际时间，请展开计划信息查看状态。")
+                    : installedTaskExists ? "当前 Windows 计划已暂停；显示的是保存配置中的下一次时间。"
+                    : "Windows 中没有已安装计划；显示的是本地配置预览。";
             timelineList.BeginUpdate();
             try
             {
@@ -4513,12 +6579,12 @@ namespace CodexQuotaWaker
                     else if (next != null && item.Time == next.Time && item.Source == next.Source)
                     {
                         state = "下一次";
-                        color = Color.FromArgb(28, 125, 80);
+                        color = Purple;
                     }
                     else
                     {
                         state = "待执行";
-                        color = Color.FromArgb(55, 87, 140);
+                        color = Color.FromArgb(113, 106, 128);
                     }
                     ListViewItem row = new ListViewItem(state);
                     row.ForeColor = color;
@@ -4530,18 +6596,18 @@ namespace CodexQuotaWaker
                 {
                     timelineSummaryLabel.Text = draft
                         ? "尚未保存的计划预览为空。"
-                        : "尚未保存可展示的计划。修改计划后点击“保存并启用”即可在此查看。";
+                        : "本地配置中没有未来触发时间；添加序列或额外唤醒后可预览。";
                 }
                 else if (plan.Count > visibleLimit)
                 {
-                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "当前已保存计划共 ")
+                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "本地配置预览共 ")
                         + plan.Count + " 条；为保持清晰，仅显示前 " + visibleLimit + " 条。";
                 }
                 else
                 {
                     int futureCount = plan.Count(delegate(PlannedRun item) { return item.Time > now; });
-                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "当前已保存计划共 ")
-                        + plan.Count + " 条；待执行 " + futureCount + " 条。绿色行是下一次触发。";
+                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "本地配置预览共 ")
+                        + plan.Count + " 条；待执行 " + futureCount + " 条。紫色标记是下一次触发。";
                 }
             }
             finally
@@ -4549,6 +6615,11 @@ namespace CodexQuotaWaker
                 timelineList.EndUpdate();
             }
             ResizeTimelineColumns();
+        }
+
+        private static string FormatTaskTime(DateTime? value)
+        {
+            return value.HasValue ? value.Value.ToString("yyyy-MM-dd HH:mm") : "—";
         }
 
         private static string FormatIso(string value)
@@ -4620,7 +6691,7 @@ namespace CodexQuotaWaker
 
         private void SetSequenceStartToNow()
         {
-            if (!SequenceStartShortcut.IsEnabled(sequenceCountBox.Text))
+            if (!SequenceStartShortcut.IsEnabled())
             {
                 return;
             }
@@ -4646,14 +6717,16 @@ namespace CodexQuotaWaker
         private void UpdateSequenceSummary()
         {
             int count;
-            bool validCount = int.TryParse(sequenceCountBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out count) && count >= 0;
+            bool validCount = SequenceCountInput.TryParse(sequenceCountBox.Text, out count);
             if (!validCount)
             {
+                sequenceDatePicker.Enabled = true;
+                sequenceTimePicker.Enabled = true;
                 sequenceSummaryLabel.Text = "请输入大于等于 0 的整数；次数包含首次执行。";
                 sequenceSummaryLabel.ForeColor = Color.FromArgb(160, 100, 20);
-                sequenceNowButton.Enabled = false;
-                sequenceIntervalHoursBox.Enabled = false;
-                sequenceIntervalMinutesBox.Enabled = false;
+                sequenceNowButton.Enabled = SequenceStartShortcut.IsEnabled();
+                sequenceIntervalHoursBox.Enabled = true;
+                sequenceIntervalMinutesBox.Enabled = true;
                 return;
             }
 
@@ -4668,9 +6741,11 @@ namespace CodexQuotaWaker
             int totalCount = SchedulePlanner.Build(preview, DateTime.MinValue, 1).Count;
             if (count == 0)
             {
-                sequenceNowButton.Enabled = false;
-                sequenceIntervalHoursBox.Enabled = false;
-                sequenceIntervalMinutesBox.Enabled = false;
+                sequenceDatePicker.Enabled = true;
+                sequenceTimePicker.Enabled = true;
+                sequenceNowButton.Enabled = SequenceStartShortcut.IsEnabled();
+                sequenceIntervalHoursBox.Enabled = true;
+                sequenceIntervalMinutesBox.Enabled = true;
                 sequenceSummaryLabel.Text = "序列执行 0 次；额外唤醒 " + extraCount + " 条，去重后共 " + totalCount + " 次，每条只执行一次。";
                 sequenceSummaryLabel.ForeColor = extraCount > 0
                     ? Color.FromArgb(80, 84, 92)
@@ -4678,6 +6753,8 @@ namespace CodexQuotaWaker
                 return;
             }
 
+            sequenceDatePicker.Enabled = true;
+            sequenceTimePicker.Enabled = true;
             sequenceIntervalHoursBox.Enabled = count > 1;
             sequenceIntervalMinutesBox.Enabled = count > 1;
             sequenceNowButton.Enabled = true;
@@ -4711,11 +6788,7 @@ namespace CodexQuotaWaker
             value.FiniteSequenceEnabled = true;
             value.SequenceStart = ReadSequenceStart().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
             int sequenceCount;
-            value.SequenceCount = int.TryParse(
-                sequenceCountBox.Text.Trim(),
-                NumberStyles.None,
-                CultureInfo.InvariantCulture,
-                out sequenceCount)
+            value.SequenceCount = SequenceCountInput.TryParse(sequenceCountBox.Text, out sequenceCount)
                 ? sequenceCount
                 : 0;
             value.SequenceIntervalMinutes = ReadSequenceIntervalMinutes();
@@ -4725,19 +6798,20 @@ namespace CodexQuotaWaker
 
         private bool ValidateForm(bool requireTime)
         {
+            return ValidateForm(requireTime, true);
+        }
+
+        private bool ValidateForm(bool requireTime, bool showMessages)
+        {
             int count;
-            if (!int.TryParse(sequenceCountBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out count) || count < 0)
+            if (!SequenceCountInput.TryParse(sequenceCountBox.Text, out count))
             {
-                MessageBox.Show("序列执行次数必须是大于等于 0 的整数。次数包含首次执行。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                sequenceCountBox.Focus();
-                return false;
+                return RejectValidation("序列执行次数必须是大于等于 0 的整数。次数包含首次执行。", sequenceCountBox, showMessages);
             }
 
             if (count > 1 && ReadSequenceIntervalMinutes() <= 0)
             {
-                MessageBox.Show("执行间隔至少需要 1 分钟。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                sequenceIntervalMinutesBox.Focus();
-                return false;
+                return RejectValidation("执行间隔至少需要 1 分钟。", sequenceIntervalMinutesBox, showMessages);
             }
 
             if (count > 0)
@@ -4748,14 +6822,11 @@ namespace CodexQuotaWaker
                 preview.SequenceIntervalMinutes = ReadSequenceIntervalMinutes();
                 if (!SequenceSchedule.LastRun(preview).HasValue)
                 {
-                    MessageBox.Show("执行次数过大，最后一次时间超出了 Windows 可表示范围。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    sequenceCountBox.Focus();
-                    return false;
+                    return RejectValidation("执行次数过大，最后一次时间超出了 Windows 可表示范围。", sequenceCountBox, showMessages);
                 }
                 if (requireTime && ReadSequenceStart() <= DateTime.Now)
                 {
-                    MessageBox.Show("首次执行时间必须晚于当前时间。未来日期没有天数上限。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return false;
+                    return RejectValidation("首次执行时间必须晚于当前时间。未来日期没有天数上限。", sequenceDatePicker, showMessages);
                 }
             }
 
@@ -4765,39 +6836,67 @@ namespace CodexQuotaWaker
                 bool hasSequence = count > 0;
                 if (!hasSequence && extras.Count == 0)
                 {
-                    MessageBox.Show("请至少设置 1 次序列执行或添加一个额外唤醒时间。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return false;
+                    return RejectValidation("请至少设置 1 次序列执行或添加一个额外唤醒时间。", sequenceCountBox, showMessages);
                 }
                 foreach (string value in extras)
                 {
                     DateTime extra;
                     if (AppConfig.TryParseDateTime(value, out extra) && extra <= DateTime.Now)
                     {
-                        MessageBox.Show("额外唤醒时间必须晚于当前时间：" + value, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return false;
+                        return RejectValidation("额外唤醒时间必须晚于当前时间：" + value, extraWakeList, showMessages);
                     }
                 }
             }
+            return ValidateRequestInputs(showMessages);
+        }
+
+        private bool ValidateRequestInputs()
+        {
+            return ValidateRequestInputs(true);
+        }
+
+        private bool ValidateRequestInputs(bool showMessages)
+        {
             if (string.IsNullOrWhiteSpace(modelBox.Text))
             {
-                MessageBox.Show("请选择或填写一个 Codex 模型。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return false;
+                return RejectValidation("请选择或填写一个 Codex 模型。", modelBox, showMessages);
             }
             if (string.IsNullOrWhiteSpace(promptBox.Text))
             {
-                MessageBox.Show("触发消息不能为空。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return false;
+                return RejectValidation("触发消息不能为空。", promptBox, showMessages);
             }
             return true;
         }
 
+        private bool RejectValidation(string message, Control target, bool showMessages)
+        {
+            if (showMessages)
+            {
+                MessageBox.Show(message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (target != null) target.Focus();
+            }
+            return false;
+        }
+
+        private ManualTestScheduleSnapshot CaptureManualTestScheduleSnapshot()
+        {
+            return new ManualTestScheduleSnapshot
+            {
+                SequenceCountText = sequenceCountBox.Text,
+                SequenceStart = ReadSequenceStart(),
+                SequenceIntervalMinutes = ReadSequenceIntervalMinutes(),
+                ExtraWakeTimes = AppConfig.NormalizeDateTimes(extraWakeList.Items.Cast<string>())
+            };
+        }
+
         private async Task TestNow()
         {
-            if (!ValidateForm(false))
+            if (!ValidateRequestInputs())
             {
                 return;
             }
             AppConfig testConfig = ReadForm(config != null && config.Enabled);
+            ManualTestScheduleSnapshot scheduleDraftAtConfirmation = CaptureManualTestScheduleSnapshot();
             RouteSnapshot route = CodexRouteDetector.Detect();
             string confirmMessage = "测试会沿当前 Codex / CC Switch 配置立即发送一条真实请求，并消耗相应用量。\r\n\r\n"
                 + "当前配置摘要：" + route.Summary + "\r\n"
@@ -4813,12 +6912,25 @@ namespace CodexQuotaWaker
                 return;
             }
 
-            SetBusy(true, "正在发送真实 Codex 请求…");
+            SetBusy(true, "正在发送真实 Codex 请求，并刷新可用模型…");
+            Task<RequestModelCatalogRefreshResult> modelCatalogTask;
+            try
+            {
+                modelCatalogTask = Task.Run(delegate
+                {
+                    return RequestModelCatalogService.Refresh(CodexLocator.Find(), AppPaths.ModelCatalogPath);
+                });
+            }
+            catch
+            {
+                modelCatalogTask = Task.FromResult(new RequestModelCatalogRefreshResult());
+            }
             RunRecord result = await Task.Run(delegate { return BackgroundRunner.Execute("manual", false, testConfig); });
             RefreshStatus();
-            ResetScheduleAdjustment scheduleAdjustment = ResetSchedulePlanner.Evaluate(
+            ResetScheduleAdjustment scheduleAdjustment = ManualTestSchedulePolicy.EvaluateReset(
                 result,
-                testConfig.SequenceCount,
+                scheduleDraftAtConfirmation,
+                CaptureManualTestScheduleSnapshot(),
                 DateTime.Now);
             if (scheduleAdjustment.Applied)
             {
@@ -4832,41 +6944,37 @@ namespace CodexQuotaWaker
                 sequenceSummaryLabel.ForeColor = Color.FromArgb(160, 100, 20);
             }
 
-            string resultMessage;
-            MessageBoxIcon resultIcon;
-            string busyMessage;
-            if (!result.Success)
+            SetBusy(false, result.Success ? "链路已联通。"
+                : "链路未联通：" + (string.IsNullOrWhiteSpace(result.Error) ? "请查看日志" : result.Error));
+            string catalogFeedback = null;
+            if (modelCatalogTask.IsCompleted)
             {
-                resultMessage = "链路未联通。\r\n\r\n"
-                    + "失败点：" + (string.IsNullOrWhiteSpace(result.Error) ? "未记录" : result.Error) + "\r\n"
-                    + "下一步：" + RouteTestPresentation.FailureNextStep(result)
-                    + "\r\n\r\n" + scheduleAdjustment.Message;
-                resultIcon = MessageBoxIcon.Error;
-                busyMessage = "链路未联通：" + (string.IsNullOrWhiteSpace(result.Error) ? "请查看日志" : result.Error);
+                RequestModelCatalogRefreshResult catalogResult;
+                try
+                {
+                    catalogResult = modelCatalogTask.Result;
+                }
+                catch
+                {
+                    catalogResult = new RequestModelCatalogRefreshResult();
+                }
+                catalogFeedback = ApplyModelCatalogRefreshResult(catalogResult, testConfig.Model);
             }
-            else
+            using (TestResultDialog dialog = new TestResultDialog(result, scheduleAdjustment, catalogFeedback, OpenLog))
             {
-                resultMessage = "链路已联通。\r\n\r\n"
-                    + RouteTestPresentation.FinalModelLabel(result) + "\r\n"
-                    + "路由摘要：" + RouteTestPresentation.RouteSummary(result);
-                if (!string.IsNullOrWhiteSpace(result.Provider))
-                {
-                    resultMessage += "\r\nprovider：" + result.Provider;
-                }
-                if (!string.IsNullOrWhiteSpace(result.UpstreamProvider))
-                {
-                    resultMessage += "\r\n实际上游：" + result.UpstreamProvider;
-                }
-                if (RouteTestPresentation.FinalModelValue(result) == "未识别")
-                {
-                    resultMessage += "\r\n\r\n最终模型证据不足，请打开日志查看本次结构化响应。";
-                }
-                resultMessage += "\r\n\r\n" + scheduleAdjustment.Message;
-                resultIcon = MessageBoxIcon.Information;
-                busyMessage = "链路已联通。";
+                if (!modelCatalogTask.IsCompleted)
+                    QueueModelCatalogFeedback(modelCatalogTask, testConfig.Model, dialog);
+                else if (catalogFeedback == null)
+                    QueueModelCatalogFeedback(modelCatalogTask, testConfig.Model, dialog);
+                if (dialog.ShowDialog(this) == DialogResult.Yes)
+                    NavigateToPlan();
             }
-            SetBusy(false, busyMessage);
-            MessageBox.Show(resultMessage, "测试请求链路", MessageBoxButtons.OK, resultIcon);
+        }
+
+        private void NavigateToPlan()
+        {
+            ScrollIntoView(sequenceDatePicker, viewport);
+            sequenceDatePicker.Focus();
         }
 
         private void SaveAndEnable()
@@ -4879,8 +6987,11 @@ namespace CodexQuotaWaker
             OperationResult result = WindowsTaskService.InstallOrUpdate(candidate);
             if (result.Success)
             {
+                candidate.RequestModelSelectionConfirmed = true;
                 config = candidate;
                 JsonStore.SaveConfig(config);
+                hasUnsavedChanges = false;
+                legacyDefaultModelMigrationPending = false;
             }
             MessageBox.Show(result.Message, Text, MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
             RefreshStatus();
@@ -4889,9 +7000,8 @@ namespace CodexQuotaWaker
         private void PauseSchedule()
         {
             OperationResult result = WindowsTaskService.Pause();
-            config = ReadForm(false);
-            JsonStore.SaveConfig(config);
-            MessageBox.Show(result.Message, Text, MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            bool draftSaved = SaveMaintenanceDraft();
+            MessageBox.Show(MaintenanceResultMessage(result.Message, draftSaved), Text, MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
             RefreshStatus();
         }
 
@@ -4907,10 +7017,42 @@ namespace CodexQuotaWaker
                 return;
             }
             OperationResult result = WindowsTaskService.Delete();
-            config = ReadForm(false);
-            JsonStore.SaveConfig(config);
-            MessageBox.Show(result.Message, Text, MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            bool draftSaved = SaveMaintenanceDraft();
+            MessageBox.Show(MaintenanceResultMessage(result.Message, draftSaved), Text, MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
             RefreshStatus();
+        }
+
+        private static string MaintenanceResultMessage(string resultMessage, bool draftSaved)
+        {
+            return draftSaved
+                ? resultMessage
+                : resultMessage + "\r\n\r\n当前执行次数为空或无效，因此没有保存表单草稿。请填写大于等于 0 的整数后再保存。";
+        }
+
+        private bool SaveMaintenanceDraft()
+        {
+            int sequenceCount;
+            if (!SequenceCountInput.TryParse(sequenceCountBox.Text, out sequenceCount))
+            {
+                hasUnsavedChanges = true;
+                return false;
+            }
+
+            AppConfig candidate = ReadForm(false);
+            candidate.SequenceCount = sequenceCount;
+            if (legacyDefaultModelMigrationPending)
+            {
+                candidate.Model = AppConfig.LegacyDefaultRequestModel;
+                candidate.RequestModelSelectionConfirmed = false;
+            }
+            else
+            {
+                candidate.RequestModelSelectionConfirmed = true;
+            }
+            config = candidate;
+            JsonStore.SaveConfig(config);
+            hasUnsavedChanges = legacyDefaultModelMigrationPending;
+            return true;
         }
 
         private void OpenLog()

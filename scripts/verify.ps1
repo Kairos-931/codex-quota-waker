@@ -1,14 +1,25 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ExePath
+)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$exePath = Join-Path $projectRoot 'dist\CodexQuotaWaker.exe'
+$canonicalExePath = Join-Path $projectRoot 'dist\CodexQuotaWaker.exe'
+if ([string]::IsNullOrWhiteSpace($ExePath)) {
+    $exePath = $canonicalExePath
+}
+else {
+    if (-not [System.IO.Path]::IsPathRooted($ExePath)) {
+        $ExePath = Join-Path $projectRoot $ExePath
+    }
+    $exePath = [System.IO.Path]::GetFullPath($ExePath)
+}
 $reportPath = Join-Path $projectRoot 'dist\self-check.txt'
 $taskXmlPath = Join-Path $projectRoot 'dist\integration-task.xml'
 $testTaskName = 'CodexQuotaWaker-IntegrationTest'
 
-& (Join-Path $PSScriptRoot 'build.ps1')
+& (Join-Path $PSScriptRoot 'build.ps1') -OutputPath $exePath
 
 if (-not (Test-Path -LiteralPath $exePath)) {
     throw "构建产物不存在：$exePath"

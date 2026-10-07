@@ -1,8 +1,9 @@
 # 额度窗口服务端验证
 
-- Status: draft
+- Status: superseded
 - Priority: P0
 - Target version: 0.5.1
+- Superseded by: docs/requirements/REQ-20260918-route-and-quota-verification.md
 - Confirmed date: not confirmed
 
 ## Objective and user value
