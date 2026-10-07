@@ -13,6 +13,7 @@ using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -24,9 +25,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.15.2.0")]
-[assembly: AssemblyFileVersion("0.15.2.0")]
-[assembly: AssemblyInformationalVersion("0.15.2")]
+[assembly: AssemblyVersion("0.16.1.0")]
+[assembly: AssemblyFileVersion("0.16.1.0")]
+[assembly: AssemblyInformationalVersion("0.16.1")]
 
 namespace CodexQuotaWaker
 {
@@ -41,12 +42,14 @@ namespace CodexQuotaWaker
 
                 if (args.Length > 0 && string.Equals(args[0], "--run-scheduled", StringComparison.OrdinalIgnoreCase))
                 {
-                    RunRecord record = BackgroundRunner.Execute("scheduled", true);
+                    string planVersion = args.Length == 3 && args[1] == "--plan-version" ? args[2] : string.Empty;
+                    RunRecord record = BackgroundRunner.Execute("scheduled", true, null, planVersion);
                     return record.Success ? 0 : 1;
                 }
 
                 if (args.Length > 0 && string.Equals(args[0], "--self-check", StringComparison.OrdinalIgnoreCase))
                 {
+                    TimelineHistoryStore.ApplicationAccessEnabled = false;
                     string reportPath = args.Length > 1 ? args[1] : Path.Combine(AppPaths.BaseDirectory, "self-check.txt");
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
@@ -100,6 +103,7 @@ namespace CodexQuotaWaker
         public static readonly string LastRunPath = Path.Combine(BaseDirectory, "last-run.json");
         public static readonly string LogPath = Path.Combine(BaseDirectory, "activity.log");
         public static readonly string ModelCatalogPath = Path.Combine(BaseDirectory, "model-catalog.json");
+        public static readonly string ExecutionHistoryPath = Path.Combine(BaseDirectory, "execution-history.json");
         public static readonly string InstalledExePath = Path.Combine(BaseDirectory, "CodexQuotaWaker.exe");
 
         public static void EnsureDirectories()
@@ -167,6 +171,7 @@ namespace CodexQuotaWaker
         public bool SleepAfterScheduledWake { get; set; }
         public bool RunWithoutLogon { get; set; }
         public bool LegacyDailyScheduleDetected { get; set; }
+        public string ScheduleVersion { get; set; }
 
         public AppConfig()
         {
@@ -184,6 +189,7 @@ namespace CodexQuotaWaker
             SleepAfterScheduledWake = false;
             RunWithoutLogon = false;
             LegacyDailyScheduleDetected = false;
+            ScheduleVersion = string.Empty;
         }
 
         public static AppConfig Normalize(AppConfig config)
@@ -315,6 +321,7 @@ namespace CodexQuotaWaker
         public string WakeEvidence { get; set; }
         public string SleepStatus { get; set; }
         public bool SleepRequested { get; set; }
+        public string TimelineRunId { get; set; }
 
         public RunRecord()
         {
@@ -1010,6 +1017,712 @@ namespace CodexQuotaWaker
                 0,
                 now.Kind);
             return minute.AddMinutes(1);
+        }
+    }
+
+    internal sealed class TimelineExecution
+    {
+        public string RunId { get; set; }
+        public string PlanKey { get; set; }
+        public string PlannedTime { get; set; }
+        public string StartedAt { get; set; }
+        public string FinishedAt { get; set; }
+        public string State { get; set; }
+        public int OwnerPid { get; set; }
+        public string OwnerStartedAt { get; set; }
+        public string ExpiresAt { get; set; }
+        public int ExitCode { get; set; }
+        public string Diagnostic { get; set; }
+    }
+
+    internal static class TimelineExecutionPolicy
+    {
+        public const string Unknown = "已到期·结果未确认";
+
+        public static string Arguments(AppConfig config)
+        {
+            Guid version;
+            return config != null && Guid.TryParse(config.ScheduleVersion, out version)
+                ? "--run-scheduled --plan-version " + version.ToString("N") : "--run-scheduled";
+        }
+
+        public static string Hash(string value)
+        {
+            using (SHA256 hash = SHA256.Create())
+                return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(value ?? ""))).Replace("-", "");
+        }
+
+        public static string PlanKey(AppConfig config, DateTime savedUtc)
+        {
+            string signature = TriggerSignature(TaskXml.Build(config, AppPaths.InstalledExePath, "fixture"));
+            return (string.IsNullOrWhiteSpace(config.ScheduleVersion)
+                ? "legacy-" + savedUtc.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture)
+                : config.ScheduleVersion) + ":" + Hash(signature);
+        }
+
+        private static string NodeText(XmlNode parent, string path, string fallback)
+        {
+            XmlNode node = parent.SelectSingleNode(path);
+            return node == null ? fallback : node.InnerText.Trim();
+        }
+
+        private static string Duration(string value)
+        {
+            return XmlConvert.ToTimeSpan(value).Ticks.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string TriggerSignature(string xml)
+        {
+            XmlDocument document = new XmlDocument();
+            document.LoadXml(xml);
+            List<string> signatures = new List<string>();
+            foreach (XmlNode trigger in document.SelectNodes("//*[local-name()='Triggers']/*"))
+            {
+                if (trigger.LocalName != "TimeTrigger") throw new InvalidOperationException("Unexpected trigger");
+                string startText = NodeText(trigger, "./*[local-name()='StartBoundary']", "");
+                DateTime start = DateTime.Parse(startText, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                if (start.Kind == DateTimeKind.Utc) start = start.ToLocalTime();
+                string repetition = "";
+                XmlNode repeat = trigger.SelectSingleNode("./*[local-name()='Repetition']");
+                if (repeat != null)
+                    repetition = Duration(NodeText(repeat, "./*[local-name()='Interval']", "PT0S")) + "/"
+                        + Duration(NodeText(repeat, "./*[local-name()='Duration']", "PT0S")) + "/"
+                        + NodeText(repeat, "./*[local-name()='StopAtDurationEnd']", "false");
+                signatures.Add(start.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "|" + repetition + "|"
+                    + NodeText(trigger, "./*[local-name()='Enabled']", "true") + "|"
+                    + NodeText(trigger, "./*[local-name()='EndBoundary']", "") + "|"
+                    + Duration(NodeText(trigger, "./*[local-name()='RandomDelay']", "PT0S")));
+            }
+            signatures.Sort(StringComparer.Ordinal);
+            return string.Join(";", signatures);
+        }
+
+        public static bool InstalledMatches(AppConfig config, WindowsTaskStatus status)
+        {
+            try
+            {
+                if (!status.Exists || string.IsNullOrWhiteSpace(status.DefinitionXml)) return false;
+                XmlDocument xml = new XmlDocument();
+                xml.LoadXml(status.DefinitionXml);
+                XmlNode actions = xml.SelectSingleNode("//*[local-name()='Actions']");
+                if (actions == null || actions.ChildNodes.Count != 1 || actions.FirstChild.LocalName != "Exec") return false;
+                string args = NodeText(actions.FirstChild, "./*[local-name()='Arguments']", "");
+                string command = NodeText(actions.FirstChild, "./*[local-name()='Command']", "");
+                if (!string.Equals(Path.GetFullPath(command), Path.GetFullPath(AppPaths.InstalledExePath), StringComparison.OrdinalIgnoreCase)) return false;
+                Guid version;
+                if (!string.IsNullOrWhiteSpace(config.ScheduleVersion) && !Guid.TryParse(config.ScheduleVersion, out version)) return false;
+                return args == Arguments(config) && TriggerSignature(status.DefinitionXml)
+                    == TriggerSignature(TaskXml.Build(config, AppPaths.InstalledExePath, "fixture"));
+            }
+            catch { return false; }
+        }
+
+        public static PlannedRun Associate(AppConfig config, WindowsTaskStatus status, DateTime started,
+            DateTime savedUtc, IEnumerable<TimelineExecution> history, string invokedVersion)
+        {
+            if (!InstalledMatches(config, status) || !status.LastRunTime.HasValue
+                || !string.Equals(config.ScheduleVersion ?? "", invokedVersion ?? "", StringComparison.Ordinal)) return null;
+            DateTime launch = status.LastRunTime.Value;
+            // The Windows launch corroborates this request. The short startup window
+            // never selects an entry: there must be exactly one unclaimed due entry.
+            if (started < launch || (started - launch).TotalSeconds > 90 || savedUtc.ToUniversalTime() > launch.ToUniversalTime()) return null;
+            return UniqueDue(config, launch, savedUtc, history);
+        }
+
+        internal static PlannedRun UniqueDue(AppConfig config, DateTime through, DateTime savedUtc, IEnumerable<TimelineExecution> history)
+        {
+            string key = PlanKey(config, savedUtc);
+            HashSet<string> claimed = new HashSet<string>(history.Where(delegate(TimelineExecution entry) { return entry.PlanKey == key; })
+                .Select(delegate(TimelineExecution entry) { return entry.PlannedTime; }), StringComparer.Ordinal);
+            List<PlannedRun> due = SchedulePlanner.Build(config, through, 14).Where(delegate(PlannedRun item)
+            {
+                return item.Time <= through && !claimed.Contains(item.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture));
+            }).Take(2).ToList();
+            return due.Count == 1 ? due[0] : null;
+        }
+
+        public static bool BusinessSuccess(RunRecord record)
+        {
+            return record.Success && record.ExitCode == 0 && record.AttemptCount > 0
+                && !string.IsNullOrWhiteSpace(record.Output)
+                && !record.Output.StartsWith("已收到 Codex 结构化响应", StringComparison.Ordinal);
+        }
+
+        public static bool ProcessAlive(TimelineExecution entry)
+        {
+            try
+            {
+                using (Process owner = Process.GetProcessById(entry.OwnerPid))
+                    return !owner.HasExited && owner.StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) == entry.OwnerStartedAt;
+            }
+            catch { return false; }
+        }
+
+        public static string State(PlannedRun item, string key, IEnumerable<TimelineExecution> history, DateTime now, bool draft)
+        {
+            if (!draft)
+            {
+                string time = item.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+                TimelineExecution entry = history.Where(delegate(TimelineExecution run) { return run.PlanKey == key && run.PlannedTime == time; })
+                    .OrderByDescending(delegate(TimelineExecution run) { return run.StartedAt; }).FirstOrDefault();
+                if (entry != null)
+                {
+                    if (entry.State == "success") return "执行成功";
+                    if (entry.State == "failure") return "执行失败";
+                    DateTimeOffset expires;
+                    if (entry.State == "running" && DateTimeOffset.TryParse(entry.ExpiresAt, out expires)
+                        && expires > new DateTimeOffset(now) && ProcessAlive(entry)) return "执行中";
+                }
+            }
+            return item.Time <= now ? Unknown : "待执行";
+        }
+    }
+
+    internal sealed class LegacyLogExecution
+    {
+        public DateTime Started { get; set; }
+        public DateTime Finished { get; set; }
+        public string Model { get; set; }
+        public string State { get; set; }
+    }
+
+    internal static class LegacyTimelineEvidence
+    {
+        private static readonly Regex Line = new Regex(@"^(?<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?<level>[A-Z]+)\] (?<message>.*)$");
+        private static readonly Regex Begin = new Regex(@"^开始 (?<mode>[a-z-]+) 触发；model=(?<model>[^；;]+)");
+
+        internal static List<LegacyLogExecution> Parse(IEnumerable<string> lines)
+        {
+            List<LegacyLogExecution> completed = new List<LegacyLogExecution>();
+            LegacyLogExecution current = null;
+            bool acceptedResponse = false;
+            bool blocked = false;
+            DateTime previous = DateTime.MinValue;
+            foreach (string line in lines)
+            {
+                Match parsed = Line.Match(line ?? "");
+                DateTime time;
+                if (!parsed.Success || !DateTime.TryParseExact(parsed.Groups["time"].Value, "yyyy-MM-dd HH:mm:ss",
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out time)) continue;
+                time = DateTime.SpecifyKind(time, DateTimeKind.Local);
+                if (time < previous || TimeZoneInfo.Local.IsAmbiguousTime(time) || TimeZoneInfo.Local.IsInvalidTime(time))
+                {
+                    current = null;
+                    blocked = true;
+                    continue;
+                }
+                previous = time;
+                string message = parsed.Groups["message"].Value;
+                string level = parsed.Groups["level"].Value;
+                Match begin = Begin.Match(message);
+                if (level == "INFO" && begin.Success)
+                {
+                    blocked = current != null;
+                    acceptedResponse = false;
+                    current = new LegacyLogExecution { Started = time, Model = begin.Groups["model"].Value,
+                        State = begin.Groups["mode"].Value == "scheduled" ? "scheduled" : "excluded" };
+                    continue;
+                }
+                if (current == null) continue;
+                if (level == "INFO" && message.StartsWith("Codex 请求成功并获得有效模型响应；", StringComparison.Ordinal)) acceptedResponse = true;
+                bool success = level == "SUCCESS" && message.Trim() == "触发完成。";
+                bool failure = level == "FAIL";
+                if (!success && !failure) continue;
+                double seconds = (time - current.Started).TotalSeconds;
+                if (!blocked && current.State == "scheduled" && seconds >= 0
+                    && seconds <= ExecutionBudget.TotalSeconds(5) + 90 && (success ? acceptedResponse : !acceptedResponse))
+                {
+                    current.Finished = time;
+                    current.State = success ? "success" : "failure";
+                    completed.Add(current);
+                }
+                current = null;
+                acceptedResponse = false;
+                blocked = false;
+            }
+            return completed;
+        }
+
+        internal static void Recover(AppConfig config, WindowsTaskStatus status, RunRecord last, DateTime savedUtc,
+            IEnumerable<string> lines, List<TimelineExecution> history, DateTimeOffset now)
+        {
+            DateTimeOffset latestStarted, latestFinished;
+            if (!string.IsNullOrWhiteSpace(config.ScheduleVersion) || !TimelineExecutionPolicy.InstalledMatches(config, status)
+                || !status.DefinitionSavedUtc.HasValue || last == null
+                || !DateTimeOffset.TryParse(last.StartedAt, out latestStarted) || !DateTimeOffset.TryParse(last.FinishedAt, out latestFinished)) return;
+            foreach (LegacyLogExecution run in Parse(lines))
+            {
+                if (run.Model != config.Model || run.Started.ToUniversalTime() < savedUtc.ToUniversalTime()
+                    || run.Started.ToUniversalTime() < status.DefinitionSavedUtc.Value.ToUniversalTime()
+                    || new DateTimeOffset(run.Finished) > now
+                    || TimeZoneInfo.Local.GetUtcOffset(run.Started) != latestStarted.Offset) continue;
+                // Corroborate the most recent log block against its structured result.
+                // Earlier blocks require their own accepted-response/terminal evidence.
+                bool isLatest = Math.Abs((run.Started - latestStarted.LocalDateTime).TotalSeconds) <= 90;
+                if (isLatest)
+                {
+                    if (last.Mode != "scheduled" || latestFinished < latestStarted
+                        || Math.Abs((run.Finished - latestFinished.LocalDateTime).TotalSeconds) > 2
+                        || (run.State == "success") != TimelineExecutionPolicy.BusinessSuccess(last)) continue;
+                }
+                PlannedRun match = TimelineExecutionPolicy.UniqueDue(config, run.Started, savedUtc, history);
+                if (match == null) continue;
+                string key = TimelineExecutionPolicy.PlanKey(config, savedUtc);
+                TimelineExecution unassigned = isLatest && !string.IsNullOrWhiteSpace(last.TimelineRunId)
+                    ? history.FirstOrDefault(delegate(TimelineExecution entry)
+                    {
+                        DateTimeOffset recordedStart, recordedFinish;
+                        return entry.RunId == last.TimelineRunId && entry.PlanKey == key && string.IsNullOrWhiteSpace(entry.PlannedTime)
+                            && entry.State == run.State && DateTimeOffset.TryParse(entry.StartedAt, out recordedStart)
+                            && DateTimeOffset.TryParse(entry.FinishedAt, out recordedFinish)
+                            && recordedStart == latestStarted && recordedFinish == latestFinished;
+                    }) : null;
+                if (unassigned != null)
+                {
+                    unassigned.PlannedTime = match.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+                    unassigned.Diagnostic = "依据逐次业务日志及完整运行标识确认条目归属";
+                    continue;
+                }
+                history.Add(new TimelineExecution
+                {
+                    RunId = "legacy-log-" + TimelineExecutionPolicy.Hash(run.Started.ToString("o") + run.Finished.ToString("o") + run.State),
+                    PlanKey = key, PlannedTime = match.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),
+                    StartedAt = new DateTimeOffset(run.Started).ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                    FinishedAt = new DateTimeOffset(run.Finished).ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                    State = run.State, ExitCode = run.State == "success" ? 0 : -1,
+                    Diagnostic = "依据逐次业务日志、执行前保存且一致的计划定义及唯一条目恢复"
+                });
+            }
+        }
+
+        internal static string[] ReadLogTail(string path)
+        {
+            try
+            {
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long start = Math.Max(0, stream.Length - 512 * 1024);
+                    stream.Seek(start, SeekOrigin.Begin);
+                    using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        if (start > 0) reader.ReadLine();
+                        return reader.ReadToEnd().Split(new[] { '\n' }).Select(delegate(string value) { return value.TrimEnd('\r'); }).ToArray();
+                    }
+                }
+            }
+            catch { return new string[0]; }
+        }
+    }
+
+    internal static class TimelineHistoryStore
+    {
+        public static bool ApplicationAccessEnabled = true;
+        private const int HistoryLimit = 500;
+
+        internal static List<TimelineExecution> Load(string path)
+        {
+            try
+            {
+                if (!File.Exists(path) || new FileInfo(path).Length > 1024 * 1024) return new List<TimelineExecution>();
+                List<TimelineExecution> entries;
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                    entries = new JavaScriptSerializer().Deserialize<List<TimelineExecution>>(reader.ReadToEnd());
+                return (entries ?? new List<TimelineExecution>()).Where(delegate(TimelineExecution entry)
+                    { return entry != null && !string.IsNullOrWhiteSpace(entry.RunId) && !string.IsNullOrWhiteSpace(entry.PlanKey); })
+                    .OrderByDescending(delegate(TimelineExecution entry) { return entry.StartedAt; }).Take(HistoryLimit).ToList();
+            }
+            catch { return new List<TimelineExecution>(); }
+        }
+
+        internal static void Mutate(string path, Action<List<TimelineExecution>> change)
+        {
+            using (Mutex mutex = new Mutex(false, "Global\\CodexQuotaWaker-History-" + TimelineExecutionPolicy.Hash(Path.GetFullPath(path))))
+            {
+                bool acquired = false;
+                string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    try { acquired = mutex.WaitOne(2000); } catch (AbandonedMutexException) { acquired = true; }
+                    if (!acquired) return;
+                    List<TimelineExecution> entries = Load(path);
+                    change(entries);
+                    entries = entries.OrderByDescending(delegate(TimelineExecution entry) { return entry.StartedAt; }).Take(HistoryLimit).ToList();
+                    File.WriteAllText(temp, new JavaScriptSerializer().Serialize(entries), new UTF8Encoding(false));
+                    for (int attempt = 0; ; attempt++)
+                    {
+                        try
+                        {
+                            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+                            break;
+                        }
+                        catch (IOException)
+                        {
+                            // Readers/scanners can briefly hold Windows file metadata.
+                            // Keep the existing history intact and retry the atomic replace.
+                            if (attempt >= 4) throw;
+                            Thread.Sleep(50 * (1 << attempt));
+                        }
+                    }
+                }
+                finally
+                {
+                    if (File.Exists(temp)) File.Delete(temp);
+                    if (acquired) mutex.ReleaseMutex();
+                }
+            }
+        }
+
+        public static void Begin(AppConfig config, RunRecord record, string invokedVersion)
+        {
+            if (!ApplicationAccessEnabled || record.Mode != "scheduled") return;
+            try
+            {
+                WindowsTaskStatus status = WindowsTaskService.GetStatus();
+                DateTime savedUtc = File.GetLastWriteTimeUtc(AppPaths.ConfigPath);
+                RunRecord previous = JsonStore.LoadLastRun();
+                string[] logEvidence = LegacyTimelineEvidence.ReadLogTail(AppPaths.LogPath);
+                Mutate(AppPaths.ExecutionHistoryPath, delegate(List<TimelineExecution> entries)
+                {
+                    BeginEvidence(config, status, record, invokedVersion, savedUtc, previous, logEvidence, entries, DateTimeOffset.Now);
+                });
+            }
+            catch { Logger.Write("WARN", "无法可靠记录计划执行关联；时间线将保留结果未确认。"); }
+        }
+
+        internal static void BeginEvidence(AppConfig config, WindowsTaskStatus status, RunRecord record, string invokedVersion,
+            DateTime savedUtc, RunRecord previous, IEnumerable<string> logs, List<TimelineExecution> history, DateTimeOffset now)
+        {
+            if (record.Mode != "scheduled") return;
+            RecoverBeforeRun(config, status, previous, savedUtc, logs, history, now);
+            DateTime started = DateTimeOffset.Parse(record.StartedAt, CultureInfo.InvariantCulture).LocalDateTime;
+            PlannedRun match = TimelineExecutionPolicy.Associate(config, status, started, savedUtc, history, invokedVersion);
+            using (Process current = Process.GetCurrentProcess())
+            {
+                TimelineExecution entry = new TimelineExecution
+                {
+                    RunId = Guid.NewGuid().ToString("N"), PlanKey = TimelineExecutionPolicy.PlanKey(config, savedUtc),
+                    PlannedTime = match == null ? string.Empty : match.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),
+                    StartedAt = new DateTimeOffset(started).ToUniversalTime().ToString("o", CultureInfo.InvariantCulture), State = "running",
+                    OwnerPid = current.Id, OwnerStartedAt = current.StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                    ExpiresAt = now.AddSeconds(ExecutionBudget.TotalSeconds(config.RetryCount) + 90).ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                    ExitCode = -1, Diagnostic = match == null ? "运行已记录，条目归属未确认" : "请求正在执行"
+                };
+                history.Add(entry);
+                record.TimelineRunId = entry.RunId;
+            }
+        }
+
+        internal static void RecoverBeforeRun(AppConfig config, WindowsTaskStatus status, RunRecord previous, DateTime savedUtc,
+            IEnumerable<string> logs, List<TimelineExecution> history, DateTimeOffset now)
+        {
+            LegacyTimelineEvidence.Recover(config, status, previous, savedUtc, logs, history, now);
+            TimelineExecution fallback = LegacyEntry(config, status, previous, savedUtc, history, now);
+            if (fallback != null) history.Add(fallback);
+        }
+
+        public static void Finish(RunRecord record)
+        {
+            if (!ApplicationAccessEnabled || record.Mode != "scheduled" || string.IsNullOrWhiteSpace(record.TimelineRunId)) return;
+            try
+            {
+                Mutate(AppPaths.ExecutionHistoryPath, delegate(List<TimelineExecution> entries)
+                {
+                    ApplyResult(entries, record);
+                });
+            }
+            catch { Logger.Write("WARN", "计划执行结果未能写入历史；时间线将保留结果未确认。"); }
+        }
+
+        internal static void ApplyResult(List<TimelineExecution> entries, RunRecord record)
+        {
+            if (record.Mode != "scheduled" || string.IsNullOrWhiteSpace(record.TimelineRunId)) return;
+            TimelineExecution entry = entries.FirstOrDefault(delegate(TimelineExecution run) { return run.RunId == record.TimelineRunId; });
+            if (entry == null) return;
+            entry.State = TimelineExecutionPolicy.BusinessSuccess(record) ? "success" : "failure";
+            entry.FinishedAt = DateTimeOffset.Parse(record.FinishedAt, CultureInfo.InvariantCulture).ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+            entry.ExitCode = record.ExitCode;
+            entry.Diagnostic = entry.State == "success" ? "收到有效模型响应" : "请求未成功，请查看最近结果或本地日志";
+        }
+
+        internal static TimelineExecution LegacyEntry(AppConfig config, WindowsTaskStatus status, RunRecord last,
+            DateTime savedUtc, List<TimelineExecution> history, DateTimeOffset now)
+        {
+            DateTimeOffset started, finished;
+            if (last == null || last.Mode != "scheduled" || !string.IsNullOrWhiteSpace(last.TimelineRunId)
+                || !string.IsNullOrWhiteSpace(config.ScheduleVersion)
+                || !DateTimeOffset.TryParse(last.StartedAt, out started) || !DateTimeOffset.TryParse(last.FinishedAt, out finished)
+                || finished < started || finished > now) return null;
+            PlannedRun match = TimelineExecutionPolicy.Associate(config, status, started.LocalDateTime, savedUtc, history, "");
+            if (match == null) return null;
+            return new TimelineExecution
+            {
+                RunId = "legacy-" + TimelineExecutionPolicy.Hash(last.StartedAt + last.FinishedAt),
+                PlanKey = TimelineExecutionPolicy.PlanKey(config, savedUtc), PlannedTime = match.Time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),
+                StartedAt = started.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture), FinishedAt = finished.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                State = TimelineExecutionPolicy.BusinessSuccess(last) ? "success" : "failure", ExitCode = last.ExitCode,
+                Diagnostic = "依据一致的 Windows 计划、唯一到期条目和既有业务结果恢复"
+            };
+        }
+
+        public static List<TimelineExecution> ReadForTimeline(AppConfig config, WindowsTaskStatus status, RunRecord last)
+        {
+            if (!ApplicationAccessEnabled) return new List<TimelineExecution>();
+            try
+            {
+                List<TimelineExecution> history = Load(AppPaths.ExecutionHistoryPath);
+                DateTime savedUtc = File.GetLastWriteTimeUtc(AppPaths.ConfigPath);
+                string[] logs = LegacyTimelineEvidence.ReadLogTail(AppPaths.LogPath);
+                Mutate(AppPaths.ExecutionHistoryPath, delegate(List<TimelineExecution> entries)
+                {
+                    RecoverBeforeRun(config, status, last, savedUtc, logs, entries, DateTimeOffset.Now);
+                });
+                return Load(AppPaths.ExecutionHistoryPath);
+            }
+            catch { return new List<TimelineExecution>(); }
+        }
+    }
+
+    internal static class TimelineExecutionChecks
+    {
+        internal static bool Verify(out string evidence)
+        {
+            List<string> checks = new List<string>();
+            bool ok = true;
+            Action<string, bool> check = delegate(string name, bool passed) { checks.Add(name + "=" + passed); ok = ok && passed; };
+            DateTime start = new DateTime(2026, 10, 7, 17, 27, 0, DateTimeKind.Local);
+            DateTime now = start.AddMinutes(2);
+            DateTime savedUtc = start.AddHours(-1).ToUniversalTime();
+            AppConfig config = new AppConfig { Enabled = true, SequenceStart = "2026-10-07 17:27", SequenceCount = 3, SequenceIntervalMinutes = 303 };
+            WindowsTaskStatus status = new WindowsTaskStatus { Exists = true, Enabled = true,
+                DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture"), LastRunTime = start.AddSeconds(28) };
+            List<TimelineExecution> history = new List<TimelineExecution>();
+            string key = TimelineExecutionPolicy.PlanKey(config, savedUtc);
+            PlannedRun first = SchedulePlanner.Build(config, now, 14)[0];
+            RunRecord legacy = new RunRecord { Mode = "scheduled", StartedAt = start.AddSeconds(33).ToString("o"),
+                FinishedAt = start.AddMinutes(1).AddSeconds(5).ToString("o"), Success = true, ExitCode = 0, AttemptCount = 1, Output = "有效模型回复" };
+            TimelineExecution recovered = TimelineHistoryStore.LegacyEntry(config, status, legacy, savedUtc, history, new DateTimeOffset(now));
+            check("legacyUniqueSuccess", recovered != null && recovered.State == "success");
+            if (recovered != null) history.Add(recovered);
+            check("restartSuccess", TimelineExecutionPolicy.State(first, key, history, now, false) == "执行成功");
+            check("draftIsPreview", TimelineExecutionPolicy.State(first, key, history, now, true) == TimelineExecutionPolicy.Unknown);
+            check("noBroadcast", TimelineExecutionPolicy.State(SchedulePlanner.Build(config, now, 14)[1], key, history, start.AddHours(6), false) == TimelineExecutionPolicy.Unknown);
+            check("duplicateNotReassigned", TimelineExecutionPolicy.Associate(config, status, start.AddSeconds(33), savedUtc, history, "") == null);
+            legacy.Mode = "manual";
+            check("manualNotImported", TimelineHistoryStore.LegacyEntry(config, status, legacy, savedUtc, new List<TimelineExecution>(), new DateTimeOffset(now)) == null);
+            legacy.Mode = "scheduled";
+            check("configEditedAfterRun", TimelineHistoryStore.LegacyEntry(config, status, legacy, now.ToUniversalTime(), new List<TimelineExecution>(), new DateTimeOffset(now)) == null);
+            status.LastRunTime = start.AddHours(2);
+            check("uniqueDelayed", TimelineExecutionPolicy.Associate(config, status, start.AddHours(2).AddSeconds(5), savedUtc, new List<TimelineExecution>(), "") != null);
+            status.LastRunTime = start.AddHours(6);
+            check("ambiguousDelayed", TimelineExecutionPolicy.Associate(config, status, start.AddHours(6).AddSeconds(5), savedUtc, new List<TimelineExecution>(), "") == null);
+            check("provenNextSlot", TimelineExecutionPolicy.Associate(config, status, start.AddHours(6).AddSeconds(5), savedUtc, history, "") != null);
+            check("launchNotCorroborated", TimelineExecutionPolicy.Associate(config, status, start.AddHours(6).AddMinutes(2), savedUtc, history, "") == null);
+
+            config.ScheduleVersion = Guid.NewGuid().ToString("N");
+            string versionKey = TimelineExecutionPolicy.PlanKey(config, savedUtc);
+            check("sameTimeNewVersion", versionKey != key && TimelineExecutionPolicy.State(first, versionKey, history, now, false) == TimelineExecutionPolicy.Unknown);
+            check("oldTaskRejected", !TimelineExecutionPolicy.InstalledMatches(config, status));
+            status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+            status.LastRunTime = start.AddSeconds(28);
+            check("newVersionArguments", TimelineExecutionPolicy.InstalledMatches(config, status)
+                && TimelineExecutionPolicy.Associate(config, status, start.AddSeconds(33), savedUtc, new List<TimelineExecution>(), "old-version") == null
+                && TimelineExecutionPolicy.Associate(config, status, start.AddSeconds(33), savedUtc, new List<TimelineExecution>(), config.ScheduleVersion) != null);
+            AppConfig changed = JsonStore.Deserialize<AppConfig>(JsonStore.Serialize(config));
+            changed.SequenceIntervalMinutes++;
+            check("definitionMismatch", !TimelineExecutionPolicy.InstalledMatches(changed, status)
+                && TimelineExecutionPolicy.PlanKey(changed, savedUtc) != versionKey);
+            config.SequenceCount = 0;
+            config.ExtraWakeTimes.Add("2026-10-07 17:27");
+            config.ExtraWakeTimes.Add("2026-10-07 17:27");
+            status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+            check("zeroAndExtraDedup", TimelineExecutionPolicy.Associate(config, status, start.AddSeconds(33), savedUtc, new List<TimelineExecution>(), config.ScheduleVersion) != null
+                && SchedulePlanner.Build(config, now, 14).Count == 1);
+
+            TimelineExecution running;
+            using (Process owner = Process.GetCurrentProcess())
+                running = new TimelineExecution { RunId = "fixture-running", PlanKey = key, PlannedTime = "2026-10-07 17:27", State = "running",
+                    StartedAt = new DateTimeOffset(start).ToUniversalTime().ToString("o"), OwnerPid = owner.Id,
+                    OwnerStartedAt = owner.StartTime.ToUniversalTime().ToString("o"), ExpiresAt = new DateTimeOffset(now.AddMinutes(10)).ToString("o") };
+            List<TimelineExecution> active = new List<TimelineExecution> { running };
+            check("actualRunning", TimelineExecutionPolicy.State(first, key, active, now, false) == "执行中");
+            running.OwnerStartedAt = "wrong-process-generation";
+            check("pidReuseOrCrash", TimelineExecutionPolicy.State(first, key, active, now, false) == TimelineExecutionPolicy.Unknown);
+            using (Process owner = Process.GetCurrentProcess()) running.OwnerStartedAt = owner.StartTime.ToUniversalTime().ToString("o");
+            running.ExpiresAt = new DateTimeOffset(now.AddSeconds(-1)).ToString("o");
+            check("boundedRunning", TimelineExecutionPolicy.State(first, key, active, now, false) == TimelineExecutionPolicy.Unknown);
+            RunRecord result = new RunRecord { Mode = "manual", TimelineRunId = running.RunId, FinishedAt = new DateTimeOffset(now).ToString("o"),
+                Success = true, ExitCode = 0, AttemptCount = 1, Output = "有效模型回复", Error = "token=do-not-store" };
+            TimelineHistoryStore.ApplyResult(active, result);
+            check("manualDoesNotFinish", running.State == "running");
+            result.Mode = "scheduled";
+            result.Output = "";
+            TimelineHistoryStore.ApplyResult(active, result);
+            check("zeroExitNotBusinessSuccess", running.State == "failure" && TimelineExecutionPolicy.State(first, key, active, now, false) == "执行失败");
+            result.Output = "有效模型回复";
+            TimelineHistoryStore.ApplyResult(active, result);
+            check("businessSuccess", running.State == "success" && TimelineExecutionPolicy.State(first, key, active, now, false) == "执行成功");
+
+            string path = Path.Combine(Path.GetTempPath(), "CodexQuotaWaker-TimelineCheck-" + Guid.NewGuid().ToString("N") + ".json");
+            try
+            {
+                TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries) { entries.Add(running); });
+                List<TimelineExecution> loaded = TimelineHistoryStore.Load(path);
+                check("persistentRestart", loaded.Count == 1 && TimelineExecutionPolicy.State(first, key, loaded, now, false) == "执行成功");
+                check("noRawOrCredentials", File.ReadAllText(path).IndexOf("token=", StringComparison.Ordinal) < 0
+                    && File.ReadAllText(path).IndexOf("有效模型回复", StringComparison.Ordinal) < 0);
+                Task[] writers = new[] { "writer-a", "writer-b" }.Select(delegate(string id)
+                    { return Task.Run(delegate { TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries)
+                        { entries.Add(new TimelineExecution { RunId = id, PlanKey = key, StartedAt = new DateTimeOffset(now).ToString("o") }); }); }); }).ToArray();
+                Task.WaitAll(writers);
+                check("concurrentAtomicWrites", TimelineHistoryStore.Load(path).Count == 3);
+                TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries)
+                {
+                    for (int index = 0; index < 510; index++)
+                        entries.Add(new TimelineExecution { RunId = "bounded-" + index, PlanKey = key, StartedAt = new DateTimeOffset(now.AddMinutes(index)).ToString("o") });
+                });
+                check("boundedHistory", TimelineHistoryStore.Load(path).Count == 500);
+                File.WriteAllText(path, "invalid-json");
+                check("badHistorySafe", TimelineHistoryStore.Load(path).Count == 0);
+            }
+            finally { if (File.Exists(path)) File.Delete(path); }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+    }
+
+    internal static class TimelineContinuityChecks
+    {
+        private static RunRecord Result(DateTime started, bool success)
+        {
+            return new RunRecord { Mode = "scheduled", StartedAt = new DateTimeOffset(started).ToString("o"),
+                FinishedAt = new DateTimeOffset(started.AddSeconds(30)).ToString("o"), Success = success,
+                ExitCode = success ? 0 : 1, AttemptCount = 1, Output = success ? "有效模型回复" : "", Model = AppConfig.DefaultRequestModel };
+        }
+
+        private static string[] Logs(RunRecord record)
+        {
+            DateTime start = DateTimeOffset.Parse(record.StartedAt).LocalDateTime;
+            DateTime finish = DateTimeOffset.Parse(record.FinishedAt).LocalDateTime;
+            List<string> lines = new List<string> { start.ToString("yyyy-MM-dd HH:mm:ss") + " [INFO] 开始 " + record.Mode + " 触发；model=" + record.Model + "; route=fixture" };
+            if (record.Success)
+            {
+                lines.Add(finish.ToString("yyyy-MM-dd HH:mm:ss") + " [INFO] Codex 请求成功并获得有效模型响应；route=fixture");
+                lines.Add(finish.ToString("yyyy-MM-dd HH:mm:ss") + " [SUCCESS] 触发完成。");
+            }
+            else lines.Add(finish.ToString("yyyy-MM-dd HH:mm:ss") + " [FAIL] 请求未成功");
+            return lines.ToArray();
+        }
+
+        internal static bool Verify(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            Action<string, bool> check = delegate(string label, bool passed) { ok = ok && passed; checks.Add(label + "=" + passed); };
+            DateTime start = new DateTime(2026, 10, 7, 17, 27, 0, DateTimeKind.Local);
+            DateTime secondTime = start.AddMinutes(303);
+            DateTime savedUtc = start.AddHours(-1).ToUniversalTime();
+            AppConfig config = new AppConfig { SequenceStart = "2026-10-07 17:27", SequenceCount = 10, SequenceIntervalMinutes = 303, Enabled = true };
+            WindowsTaskStatus status = new WindowsTaskStatus { Exists = true, Enabled = true, DefinitionSavedUtc = savedUtc.AddSeconds(-1) };
+            string path = Path.Combine(Path.GetTempPath(), "CodexQuotaWaker-Continuity-" + Guid.NewGuid().ToString("N") + ".json");
+            try
+            {
+                foreach (bool versioned in new[] { false, true })
+                foreach (bool success in new[] { true, false })
+                {
+                    if (File.Exists(path)) File.Delete(path);
+                    config.ScheduleVersion = versioned ? Guid.NewGuid().ToString("N") : "";
+                    status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+                    status.LastRunTime = start.AddSeconds(1);
+                    RunRecord first = Result(start.AddSeconds(2), success);
+                    TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries)
+                    { TimelineHistoryStore.BeginEvidence(config, status, first, config.ScheduleVersion, savedUtc, null, new string[0], entries, new DateTimeOffset(start.AddSeconds(2))); });
+                    TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries) { TimelineHistoryStore.ApplyResult(entries, first); });
+                    // Reload on a separate background invocation; no MainForm is constructed.
+                    status.LastRunTime = secondTime.AddSeconds(1);
+                    RunRecord second = Result(secondTime.AddSeconds(2), success);
+                    TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries)
+                    { TimelineHistoryStore.BeginEvidence(config, status, second, config.ScheduleVersion, savedUtc, first, Logs(first), entries, new DateTimeOffset(secondTime.AddSeconds(2))); });
+                    TimelineHistoryStore.Mutate(path, delegate(List<TimelineExecution> entries) { TimelineHistoryStore.ApplyResult(entries, second); });
+                    List<TimelineExecution> loaded = TimelineHistoryStore.Load(path);
+                    string expected = success ? "执行成功" : "执行失败";
+                    string key = TimelineExecutionPolicy.PlanKey(config, savedUtc);
+                    List<PlannedRun> plan = SchedulePlanner.Build(config, secondTime, 14);
+                    check("noGuiTwoRuns/" + versioned + "/" + success, loaded.Count == 2 && !string.IsNullOrWhiteSpace(first.TimelineRunId)
+                        && !string.IsNullOrWhiteSpace(second.TimelineRunId)
+                        && TimelineExecutionPolicy.State(plan[0], key, loaded, secondTime.AddMinutes(1), false) == expected
+                        && TimelineExecutionPolicy.State(plan[1], key, loaded, secondTime.AddMinutes(1), false) == expected);
+                }
+
+                config.ScheduleVersion = "";
+                status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+                status.LastRunTime = secondTime.AddSeconds(1);
+                RunRecord oldFirst = Result(start.AddSeconds(33), true);
+                RunRecord oldSecond = Result(secondTime.AddSeconds(2), true);
+                DateTimeOffset now = new DateTimeOffset(secondTime.AddMinutes(1));
+                List<TimelineExecution> bootstrap = new List<TimelineExecution>();
+                TimelineHistoryStore.BeginEvidence(config, status, oldSecond, "", savedUtc, oldFirst, Logs(oldFirst), bootstrap, new DateTimeOffset(secondTime.AddSeconds(2)));
+                TimelineHistoryStore.ApplyResult(bootstrap, oldSecond);
+                check("oldFirstRecoveredBeforeSecond", bootstrap.Count == 2 && bootstrap.All(delegate(TimelineExecution run) { return run.State == "success" && !string.IsNullOrWhiteSpace(run.PlannedTime); }));
+                oldSecond.TimelineRunId = null;
+                List<TimelineExecution> backfill = new List<TimelineExecution>();
+                string[] bothLogs = Logs(oldFirst).Concat(Logs(oldSecond)).ToArray();
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, bothLogs, backfill, now);
+                check("twoIndependentLegacyResults", backfill.Count == 2 && backfill.Select(delegate(TimelineExecution run) { return run.PlannedTime; })
+                    .SequenceEqual(new[] { "2026-10-07 17:27", "2026-10-07 22:30" }));
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, bothLogs, backfill, now);
+                check("legacyRecoveryIdempotent", backfill.Count == 2);
+
+                List<TimelineExecution> missing = new List<TimelineExecution>();
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, Logs(oldSecond), missing, now);
+                check("missedFirstNotGuessed", missing.Count == 0);
+                string[] noResponseEvidence = Logs(oldFirst).Where(delegate(string line) { return !line.Contains("有效模型响应"); }).Concat(Logs(oldSecond)).ToArray();
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, noResponseEvidence, missing, now);
+                check("terminalAloneNotSuccess", missing.Count == 0);
+                RunRecord delayed = Result(secondTime.AddSeconds(1), true);
+                TimelineHistoryStore.RecoverBeforeRun(config, status, delayed, savedUtc, Logs(delayed), missing, now);
+                check("delayedMultipleCandidatesSafe", missing.Count == 0);
+                RunRecord manual = Result(start.AddSeconds(33), true);
+                manual.Mode = "manual";
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, Logs(manual).Concat(Logs(oldSecond)), missing, now);
+                check("manualHistoryExcluded", missing.Count == 0);
+                string[] overlap = new[] { Logs(oldFirst)[0], start.AddSeconds(34).ToString("yyyy-MM-dd HH:mm:ss") + " [INFO] 开始 manual 触发；model=gpt-6-luna" }
+                    .Concat(Logs(oldFirst).Skip(1)).Concat(Logs(oldSecond)).ToArray();
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, overlap, missing, now);
+                check("overlappingLegacyEvidenceSafe", missing.Count == 0);
+                status.DefinitionSavedUtc = null;
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, bothLogs, missing, now);
+                check("definitionTimestampRequired", missing.Count == 0);
+                status.DefinitionSavedUtc = secondTime.AddMinutes(1).ToUniversalTime();
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, bothLogs, missing, now);
+                check("definitionChangedAfterRuns", missing.Count == 0);
+                status.DefinitionSavedUtc = savedUtc.AddSeconds(-1);
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, now.UtcDateTime, bothLogs, missing, now);
+                check("configChangedAfterRuns", missing.Count == 0);
+                config.ScheduleVersion = Guid.NewGuid().ToString("N");
+                status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+                TimelineHistoryStore.RecoverBeforeRun(config, status, oldSecond, savedUtc, bothLogs, missing, now);
+                check("legacyNotInNewVersion", missing.Count == 0);
+                config.ScheduleVersion = "";
+                status.DefinitionXml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+
+                RunRecord unmatched = Result(secondTime.AddSeconds(2), true);
+                TimelineHistoryStore.BeginEvidence(config, status, unmatched, "", savedUtc, null, new string[0], missing, now);
+                TimelineHistoryStore.ApplyResult(missing, unmatched);
+                check("unmatchedResultPersistedWithoutBroadcast", missing.Count == 1 && missing[0].State == "success"
+                    && missing[0].PlannedTime == "" && !string.IsNullOrWhiteSpace(unmatched.TimelineRunId)
+                    && TimelineExecutionPolicy.State(SchedulePlanner.Build(config, secondTime, 14)[1], TimelineExecutionPolicy.PlanKey(config, savedUtc), missing, now.LocalDateTime, false) == TimelineExecutionPolicy.Unknown);
+                TimelineHistoryStore.RecoverBeforeRun(config, status, unmatched, savedUtc, Logs(oldFirst).Concat(Logs(unmatched)), missing, now);
+                check("recoveryPreservesRunIdentity", missing.Count == 2 && missing.Any(delegate(TimelineExecution entry)
+                    { return entry.RunId == unmatched.TimelineRunId && entry.PlannedTime == "2026-10-07 22:30"; }));
+                int countBefore = missing.Count;
+                TimelineHistoryStore.BeginEvidence(config, status, manual, "", savedUtc, null, bothLogs, missing, now);
+                check("manualDoesNotJournal", missing.Count == countBefore);
+                check("safeLegacyDiagnostic", JsonStore.Serialize(backfill).IndexOf("有效模型回复", StringComparison.Ordinal) < 0);
+            }
+            finally { if (File.Exists(path)) File.Delete(path); }
+            evidence = string.Join("; ", checks);
+            return ok;
         }
     }
 
@@ -3154,7 +3867,7 @@ namespace CodexQuotaWaker
     {
         private const string MutexName = "Local\\CodexQuotaWaker-Runner";
 
-        public static RunRecord Execute(string mode, bool requireEnabled, AppConfig requestedConfig = null)
+        public static RunRecord Execute(string mode, bool requireEnabled, AppConfig requestedConfig = null, string invokedPlanVersion = "")
         {
             RunRecord record = new RunRecord();
             record.Mode = mode;
@@ -3201,6 +3914,9 @@ namespace CodexQuotaWaker
                         Logger.Write("INFO", record.Error);
                         return Finish(record, config, wake);
                     }
+
+                    if (mode == "scheduled")
+                        TimelineHistoryStore.Begin(config, record, invokedPlanVersion);
 
                     string codexPath = CodexLocator.Find();
                     if (string.IsNullOrWhiteSpace(codexPath))
@@ -3327,6 +4043,7 @@ namespace CodexQuotaWaker
         private static RunRecord Finish(RunRecord record, AppConfig config, WakeEvidence wake)
         {
             record.FinishedAt = DateTime.Now.ToString("o", CultureInfo.InvariantCulture);
+            TimelineHistoryStore.Finish(record);
             JsonStore.SaveLastRun(record);
             if (!record.Success)
             {
@@ -3450,7 +4167,7 @@ namespace CodexQuotaWaker
             xml.AppendLine("  <Actions Context=\"Author\">");
             xml.AppendLine("    <Exec>");
             xml.AppendLine("      <Command>" + Escape(executablePath) + "</Command>");
-            xml.AppendLine("      <Arguments>--run-scheduled</Arguments>");
+            xml.AppendLine("      <Arguments>" + Escape(TimelineExecutionPolicy.Arguments(config)) + "</Arguments>");
             xml.AppendLine("      <WorkingDirectory>" + Escape(Path.GetDirectoryName(executablePath)) + "</WorkingDirectory>");
             xml.AppendLine("    </Exec>");
             xml.AppendLine("  </Actions>");
@@ -3498,6 +4215,8 @@ namespace CodexQuotaWaker
         public DateTime? NextRunTime { get; set; }
         public DateTime? LastRunTime { get; set; }
         public string RuntimeDetailsError { get; set; }
+        public string DefinitionXml { get; set; }
+        public DateTime? DefinitionSavedUtc { get; set; }
 
         public bool CanRunWithoutLogon
         {
@@ -4019,6 +4738,7 @@ namespace CodexQuotaWaker
                 WindowsTaskStatus status = new WindowsTaskStatus
                 {
                     Exists = true,
+                    DefinitionXml = result.StandardOutput,
                     Enabled = ReadBoolean(settings, "Enabled", true),
                     WakeToRun = ReadBoolean(settings, "WakeToRun", false),
                     LogonType = ReadText(principal, "LogonType"),
@@ -4026,6 +4746,12 @@ namespace CodexQuotaWaker
                 };
                 try { ReadScheduledTaskTimes(status); }
                 catch (Exception ex) { status.RuntimeDetailsError = "Windows 已安装计划，但无法读取实际运行时间：" + ex.GetType().Name + "。请重试刷新，或检查任务计划程序服务。"; }
+                try
+                {
+                    string taskPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "Tasks", TaskXml.TaskName);
+                    if (File.Exists(taskPath)) status.DefinitionSavedUtc = File.GetLastWriteTimeUtc(taskPath);
+                }
+                catch { }
                 return status;
             }
             catch (Exception ex)
@@ -4437,6 +5163,22 @@ namespace CodexQuotaWaker
                 lines.Add("ResultPlanNavigation=" + planNavigationOk);
                 success = success && planNavigationOk;
 
+                string timelineExecutionEvidence;
+                bool timelineExecutionOk = TimelineExecutionChecks.Verify(out timelineExecutionEvidence);
+                lines.Add("TimelineExecutionEvidence=" + timelineExecutionEvidence);
+                lines.Add("TimelineExecution=" + timelineExecutionOk);
+                success = success && timelineExecutionOk;
+                string timelineRenderingEvidence;
+                bool timelineRenderingOk = MainForm.VerifyTimelineRendering(out timelineRenderingEvidence);
+                lines.Add("TimelineRenderingEvidence=" + timelineRenderingEvidence);
+                lines.Add("TimelineRendering=" + timelineRenderingOk);
+                success = success && timelineRenderingOk;
+                string timelineContinuityEvidence;
+                bool timelineContinuityOk = TimelineContinuityChecks.Verify(out timelineContinuityEvidence);
+                lines.Add("TimelineContinuityEvidence=" + timelineContinuityEvidence);
+                lines.Add("TimelineContinuity=" + timelineContinuityOk);
+                success = success && timelineContinuityOk;
+
                 bool budgetOk = ExecutionBudget.TotalSeconds(3) == 870
                     && ExecutionBudget.TaskExecutionLimitMinutes(3) == 16;
                 lines.Add("ExecutionBudget=" + budgetOk);
@@ -4714,6 +5456,9 @@ namespace CodexQuotaWaker
         private DateTime? installedNextRunTime;
         private bool installedTaskExists;
         private bool installedTaskEnabled;
+        private List<TimelineExecution> timelineHistory = new List<TimelineExecution>();
+        private DateTime timelineSavedUtc;
+        private readonly System.Windows.Forms.Timer timelineRefreshTimer = new System.Windows.Forms.Timer();
         private bool installedDetailsExpanded;
         private bool routeDetailsExpanded;
         private bool advancedExpanded;
@@ -4992,7 +5737,7 @@ namespace CodexQuotaWaker
             Panel timelineCard = NewCard("执行时间线", out timelineBody, 330);
             timelineSummaryLabel = new Label { Dock = DockStyle.Top, Height = 28, ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F) };
             timelineList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = false, BorderStyle = BorderStyle.None, HeaderStyle = ColumnHeaderStyle.Nonclickable, BackColor = Color.White, Font = new Font("Microsoft YaHei UI", 9F) };
-            timelineList.Columns.Add("状态", 72);
+            timelineList.Columns.Add("状态", 160);
             timelineList.Columns.Add("触发时间", 148);
             timelineList.Columns.Add("来源", 220);
             timelineList.Resize += delegate { ResizeTimelineColumns(); };
@@ -5071,6 +5816,17 @@ namespace CodexQuotaWaker
                 LayoutResponsive();
                 LoadState();
             };
+            timelineRefreshTimer.Interval = 5000;
+            timelineRefreshTimer.Tick += delegate
+            {
+                if (!hasUnsavedChanges && TimelineHistoryStore.ApplicationAccessEnabled)
+                {
+                    timelineHistory = TimelineHistoryStore.Load(AppPaths.ExecutionHistoryPath);
+                    UpdateTimeline(DateTime.Now);
+                }
+            };
+            Shown += delegate { if (TimelineHistoryStore.ApplicationAccessEnabled) timelineRefreshTimer.Start(); };
+            FormClosed += delegate { timelineRefreshTimer.Stop(); timelineRefreshTimer.Dispose(); };
         }
 
         private static readonly Color Purple = Color.FromArgb(118, 96, 219);
@@ -5869,6 +6625,48 @@ namespace CodexQuotaWaker
             }
         }
 
+        internal static bool VerifyTimelineRendering(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            foreach (float scale in new[] { 1F, 1.5F })
+            using (MainForm form = new MainForm())
+            {
+                IntPtr handle = form.Handle;
+                EnsureControlHandles(form);
+                typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { EventArgs.Empty });
+                form.ClientSize = new Size(760, 620);
+                form.timelineList.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                DateTime now = DateTime.Now;
+                DateTime start = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0).AddHours(-4);
+                AppConfig fixture = new AppConfig { SequenceStart = start.ToString("yyyy-MM-dd HH:mm"), SequenceCount = 6,
+                    SequenceIntervalMinutes = 60, ScheduleVersion = Guid.NewGuid().ToString("N") };
+                fixture.ExtraWakeTimes.Add(start.AddHours(6).ToString("yyyy-MM-dd HH:mm"));
+                form.config = fixture;
+                form.timelineSavedUtc = now.AddDays(-1).ToUniversalTime();
+                string key = TimelineExecutionPolicy.PlanKey(fixture, form.timelineSavedUtc);
+                form.timelineHistory.Clear();
+                using (Process owner = Process.GetCurrentProcess())
+                for (int index = 0; index < 3; index++)
+                    form.timelineHistory.Add(new TimelineExecution { RunId = "render-" + index, PlanKey = key,
+                        PlannedTime = start.AddHours(index).ToString("yyyy-MM-dd HH:mm"), StartedAt = now.ToString("o"),
+                        State = index == 0 ? "success" : index == 1 ? "failure" : "running", OwnerPid = owner.Id,
+                        OwnerStartedAt = owner.StartTime.ToUniversalTime().ToString("o"), ExpiresAt = new DateTimeOffset(now.AddMinutes(5)).ToString("o") });
+                string before = JsonStore.Serialize(fixture);
+                form.UpdateTimeline(now, fixture, false);
+                string[] actual = form.timelineList.Items.Cast<ListViewItem>().Select(delegate(ListViewItem row) { return row.Text; }).ToArray();
+                bool states = actual.SequenceEqual(new[] { "执行成功", "执行失败", "执行中", TimelineExecutionPolicy.Unknown, TimelineExecutionPolicy.Unknown, "下一次", "待执行" });
+                bool textFits = form.timelineList.Columns[0].Width >= TextRenderer.MeasureText(TimelineExecutionPolicy.Unknown, form.timelineList.Font).Width;
+                form.UpdateTimeline(now, fixture, true);
+                bool draft = form.timelineList.Items.Cast<ListViewItem>().Take(5).All(delegate(ListViewItem row) { return row.Text == TimelineExecutionPolicy.Unknown; })
+                    && form.timelineSummaryLabel.Text.Contains("预览") && JsonStore.Serialize(fixture) == before;
+                checks.Add(scale + ":states=" + states + ",statusFits=" + textFits + ",draftSeparated=" + draft);
+                ok = ok && states && textFits && draft;
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+
         internal static bool VerifyResultPlanNavigation(out string evidence)
         {
             using (MainForm form = new MainForm())
@@ -6236,7 +7034,7 @@ namespace CodexQuotaWaker
                 return;
             }
             int available = timelineList.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 8;
-            int statusWidth = Math.Min(78, Math.Max(58, available / 5));
+            int statusWidth = Math.Max(132, TextRenderer.MeasureText(TimelineExecutionPolicy.Unknown, timelineList.Font).Width + 18);
             int timeWidth = Math.Min(152, Math.Max(112, available / 3));
             timelineList.Columns[0].Width = statusWidth;
             timelineList.Columns[1].Width = timeWidth;
@@ -6367,6 +7165,9 @@ namespace CodexQuotaWaker
             DateTime now = DateTime.Now;
             RunRecord last = JsonStore.LoadLastRun();
             installedTaskExists = taskStatus.Exists;
+            timelineSavedUtc = File.GetLastWriteTimeUtc(AppPaths.ConfigPath);
+            timelineHistory = TimelineExecutionPolicy.InstalledMatches(config ?? new AppConfig(), taskStatus)
+                ? TimelineHistoryStore.ReadForTimeline(config, taskStatus, last) : new List<TimelineExecution>();
             installedTaskEnabled = taskStatus.Exists && taskStatus.Enabled;
             installedNextRunTime = taskStatus.NextRunTime;
 
@@ -6548,6 +7349,7 @@ namespace CodexQuotaWaker
             }
 
             List<PlannedRun> plan = SchedulePlanner.Build(preview, now, 14);
+            string timelineKey = TimelineExecutionPolicy.PlanKey(preview, timelineSavedUtc);
             PlannedRun heroNext = plan.FirstOrDefault(delegate(PlannedRun item) { return item.Time > now; });
             DateTime? displayNext = draft ? (heroNext == null ? (DateTime?)null : heroNext.Time)
                 : installedTaskExists && installedTaskEnabled ? installedNextRunTime
@@ -6571,9 +7373,15 @@ namespace CodexQuotaWaker
                 {
                     string state;
                     Color color;
-                    if (item.Time <= now)
+                    state = TimelineExecutionPolicy.State(item, timelineKey, timelineHistory, now, draft);
+                    if (state == "执行成功")
+                        color = Color.FromArgb(28, 125, 80);
+                    else if (state == "执行失败")
+                        color = Color.FromArgb(180, 55, 55);
+                    else if (state == "执行中")
+                        color = Purple;
+                    else if (item.Time <= now)
                     {
-                        state = "已到期";
                         color = Color.FromArgb(120, 124, 132);
                     }
                     else if (next != null && item.Time == next.Time && item.Source == next.Source)
@@ -6606,9 +7414,11 @@ namespace CodexQuotaWaker
                 else
                 {
                     int futureCount = plan.Count(delegate(PlannedRun item) { return item.Time > now; });
-                    timelineSummaryLabel.Text = (draft ? "当前未保存的计划预览共 " : "本地配置预览共 ")
-                        + plan.Count + " 条；待执行 " + futureCount + " 条。紫色标记是下一次触发。";
+                    timelineSummaryLabel.Text = (draft ? "尚未保存的预览（不显示执行结果）共 " : "当前保存计划共 ")
+                        + plan.Count + " 条；未来 " + futureCount + " 条。";
                 }
+                timelineSummaryLabel.Height = Math.Max(28, TextRenderer.MeasureText(timelineSummaryLabel.Text, timelineSummaryLabel.Font,
+                    new Size(Math.Max(100, timelineSummaryLabel.Width), int.MaxValue), TextFormatFlags.WordBreak).Height + 6);
             }
             finally
             {
@@ -6775,6 +7585,7 @@ namespace CodexQuotaWaker
         private AppConfig ReadForm(bool enabled)
         {
             AppConfig value = new AppConfig();
+            value.ScheduleVersion = config == null ? string.Empty : config.ScheduleVersion;
             value.Times = new List<string>();
             value.Model = modelBox.Text.Trim();
             // Keep the legacy field only for JSON compatibility. The active
@@ -6984,6 +7795,7 @@ namespace CodexQuotaWaker
                 return;
             }
             AppConfig candidate = ReadForm(true);
+            candidate.ScheduleVersion = Guid.NewGuid().ToString("N");
             OperationResult result = WindowsTaskService.InstallOrUpdate(candidate);
             if (result.Success)
             {
