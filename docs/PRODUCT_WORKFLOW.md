@@ -1,5 +1,11 @@
 # Product workflow
 
+## 2026-10-08 RESULT-001 已验证，待原路径更新
+
+- 用户要求继续逐项优化列表，优先选取已由用户提出且 P1 的最近成功联通。权威需求 `docs/requirements/REQ-20261007-last-successful-connection.md` 已于 2026-10-08 经用户回复 `1` 确认，批准 `gpt-6.1-sol / medium`、单聊天串行与确定性验证；已成功派发到原开发聊天，作为当前唯一在开发需求。
+- 当前开发聊天 `01a10130-e18a-7860-8690-0ed3fc4a1593` 于 2026-10-08 最近检查为 idle，上一 VERSION-001 已交付待验收，执行槽已释放。基线 `main` 的 `d6de939e65c7886439b9b1c917144df9353a9f96`，其他未提交产品规划文件保留。
+- 事件 `RESULT-001-20261008-awaiting-deployment`：0.18.0 已实现，隔离数据、跨进程竞争、迁移和宽窄 100%/150% 隐藏布局及完整 build/verify/diff 通过。用户 PID 17072 占用原 EXE，正式入口与后台副本仍为 0.17.0，等待关闭后原路径更新，不终止窗口或另建入口。无活动开发命令，执行槽释放；需求保留 `implementation_verified / awaiting_deployment`，实机视觉/真实请求未验收。详见权威需求。
+
 ## 2026-10-08 VERSION-001
 
 - 用户直接要求打开软件即可在合适位置看到版本号，属简单可逆的展示变更；权威需求 `docs/requirements/REQ-20261008-visible-app-version.md`，confirmed。

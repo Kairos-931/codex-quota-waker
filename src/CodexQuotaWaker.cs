@@ -25,9 +25,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.17.0.0")]
-[assembly: AssemblyFileVersion("0.17.0.0")]
-[assembly: AssemblyInformationalVersion("0.17.0")]
+[assembly: AssemblyVersion("0.18.0.0")]
+[assembly: AssemblyFileVersion("0.18.0.0")]
+[assembly: AssemblyInformationalVersion("0.18.0")]
 
 namespace CodexQuotaWaker
 {
@@ -115,6 +115,7 @@ namespace CodexQuotaWaker
 
         public static readonly string ConfigPath = Path.Combine(BaseDirectory, "config.json");
         public static readonly string LastRunPath = Path.Combine(BaseDirectory, "last-run.json");
+        public static readonly string LastSuccessPath = Path.Combine(BaseDirectory, "last-success.json");
         public static readonly string LogPath = Path.Combine(BaseDirectory, "activity.log");
         public static readonly string ModelCatalogPath = Path.Combine(BaseDirectory, "model-catalog.json");
         public static readonly string ExecutionHistoryPath = Path.Combine(BaseDirectory, "execution-history.json");
@@ -364,6 +365,344 @@ namespace CodexQuotaWaker
         }
     }
 
+    internal sealed class SuccessSnapshot
+    {
+        public string FinishedAtUtc { get; set; }
+        public string Source { get; set; }
+        public string FinalModel { get; set; }
+        public string Route { get; set; }
+        public string EvidenceId { get; set; }
+    }
+
+    internal static class RecentSuccessStore
+    {
+        internal static bool Time(string value, out DateTimeOffset time)
+        {
+            time = default(DateTimeOffset);
+            return !string.IsNullOrWhiteSpace(value) && Regex.IsMatch(value, @"(?:Z|[+-]\d{2}:\d{2})$")
+                && DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
+        }
+
+        private static string SafeModel(string value)
+        {
+            return !string.IsNullOrWhiteSpace(value) && value.Length <= 80
+                && Regex.IsMatch(value, @"^[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
+                && !Regex.IsMatch(value, @"^(?:sk-|sess-|eyJ)", RegexOptions.IgnoreCase) ? value : "";
+        }
+
+        internal static SuccessSnapshot FromRun(RunRecord record)
+        {
+            DateTimeOffset started, finished;
+            if (record == null || !TimelineExecutionPolicy.BusinessSuccess(record)
+                || (record.Mode != "manual" && record.Mode != "scheduled")
+                || !Time(record.StartedAt, out started) || !Time(record.FinishedAt, out finished)
+                || finished < started || finished > DateTimeOffset.UtcNow) return null;
+            string route = "";
+            if (!string.IsNullOrWhiteSpace(record.RouteSummary))
+            {
+                // Store categories from this run only, never endpoints or free-form diagnostic text.
+                switch (record.RouteType)
+                {
+                    case "direct": route = "直接链路"; break;
+                    case "cc-switch-local": route = "CC Switch 本地路由"; break;
+                    case "local-router": route = "本地路由"; break;
+                    case "custom": route = "自定义链路"; break;
+                }
+            }
+            return new SuccessSnapshot { FinishedAtUtc = finished.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                Source = record.Mode, FinalModel = SafeModel(record.FinalModel), Route = route,
+                EvidenceId = TimelineExecutionPolicy.Hash(record.Mode + "|" + record.StartedAt + "|" + record.FinishedAt) };
+        }
+
+        private static SuccessSnapshot FromTimeline(TimelineExecution entry)
+        {
+            DateTimeOffset started, finished;
+            if (entry == null || entry.State != "success" || entry.ExitCode != 0
+                || string.IsNullOrWhiteSpace(entry.RunId) || string.IsNullOrWhiteSpace(entry.PlanKey)
+                || string.IsNullOrWhiteSpace(entry.PlannedTime) || !Time(entry.StartedAt, out started)
+                || !Time(entry.FinishedAt, out finished) || finished < started || finished > DateTimeOffset.UtcNow) return null;
+            return new SuccessSnapshot { FinishedAtUtc = finished.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                Source = "scheduled", FinalModel = "", Route = "", EvidenceId = TimelineExecutionPolicy.Hash(entry.RunId) };
+        }
+
+        internal static string ReadText(string path)
+        {
+            if (new FileInfo(path).Length > 1024 * 1024) throw new IOException("Record too large.");
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader reader = new StreamReader(stream, Encoding.UTF8)) return reader.ReadToEnd();
+        }
+
+        internal static SuccessSnapshot Read(string path, out bool unavailable)
+        {
+            unavailable = false;
+            try
+            {
+                if (!File.Exists(path)) return null;
+                SuccessSnapshot value = new JavaScriptSerializer().Deserialize<SuccessSnapshot>(ReadText(path));
+                DateTimeOffset finished;
+                if (value == null || !Time(value.FinishedAtUtc, out finished) || finished > DateTimeOffset.UtcNow
+                    || (value.Source != "manual" && value.Source != "scheduled")
+                    || !Regex.IsMatch(value.EvidenceId ?? "", @"^[A-F0-9]{64}$")) throw new InvalidDataException();
+                value.FinalModel = SafeModel(value.FinalModel);
+                if (!new[] { "直接链路", "CC Switch 本地路由", "本地路由", "自定义链路" }.Contains(value.Route)) value.Route = "";
+                return value;
+            }
+            catch { unavailable = true; return null; }
+        }
+
+        internal static void AtomicWrite(string path, object value)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                File.WriteAllText(temp, new JavaScriptSerializer().Serialize(value), new UTF8Encoding(false));
+                for (int attempt = 0; ; attempt++)
+                {
+                    try { if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path); break; }
+                    catch (IOException) { if (attempt >= 4) throw; Thread.Sleep(50 * (1 << attempt)); }
+                }
+            }
+            finally { if (File.Exists(temp)) File.Delete(temp); }
+        }
+
+        private static void Locked(string path, Action action)
+        {
+            using (Mutex mutex = new Mutex(false, "Global\\CodexQuotaWaker-Results-" + TimelineExecutionPolicy.Hash(Path.GetFullPath(path).ToUpperInvariant())))
+            {
+                bool acquired = false;
+                try
+                {
+                    try { acquired = mutex.WaitOne(5000); } catch (AbandonedMutexException) { acquired = true; }
+                    if (!acquired) throw new IOException("Result store is busy.");
+                    action();
+                }
+                finally { if (acquired) mutex.ReleaseMutex(); }
+            }
+        }
+
+        private static void PublishLocked(string path, SuccessSnapshot candidate)
+        {
+            if (candidate == null) return;
+            bool unavailable;
+            SuccessSnapshot current = Read(path, out unavailable);
+            DateTimeOffset candidateTime, currentTime;
+            if (!Time(candidate.FinishedAtUtc, out candidateTime)) return;
+            if (current != null && Time(current.FinishedAtUtc, out currentTime) && currentTime >= candidateTime) return;
+            AtomicWrite(path, candidate);
+        }
+
+        internal static void SaveAttempt(string attemptPath, string successPath, RunRecord record)
+        {
+            try
+            {
+                Locked(successPath, delegate
+                {
+                    // Persist business success before last-attempt metadata (including later sleep updates).
+                    try { PublishLocked(successPath, FromRun(record)); }
+                    catch { Logger.Write("WARN", "最近成功记录暂未保存；请检查日志目录权限后重试。"); }
+                    RunRecord previous = null;
+                    try { if (File.Exists(attemptPath)) previous = new JavaScriptSerializer().Deserialize<RunRecord>(ReadText(attemptPath)); } catch { }
+                    DateTimeOffset oldTime, newTime;
+                    if (previous != null && Time(previous.FinishedAt, out oldTime)
+                        && Time(record.FinishedAt, out newTime) && oldTime > newTime) return;
+                    AtomicWrite(attemptPath, record);
+                });
+            }
+            catch { Logger.Write("WARN", "最近尝试记录暂未保存；请检查日志目录权限后重试。"); }
+        }
+
+        internal static SuccessSnapshot Recover(string path, RunRecord previous, IEnumerable<TimelineExecution> history, out bool unavailable)
+        {
+            try
+            {
+                Locked(path, delegate
+                {
+                    PublishLocked(path, FromRun(previous));
+                    foreach (TimelineExecution entry in history ?? Enumerable.Empty<TimelineExecution>()) PublishLocked(path, FromTimeline(entry));
+                });
+            }
+            catch { unavailable = true; return ReadFallback(path); }
+            return Read(path, out unavailable);
+        }
+
+        private static SuccessSnapshot ReadFallback(string path)
+        {
+            bool unavailable;
+            return Read(path, out unavailable);
+        }
+
+        public static SuccessSnapshot LoadForApplication(RunRecord previous, out bool unavailable)
+        {
+            if (!TimelineHistoryStore.ApplicationAccessEnabled) { unavailable = false; return null; }
+            return Recover(AppPaths.LastSuccessPath, previous, TimelineHistoryStore.Load(AppPaths.ExecutionHistoryPath), out unavailable);
+        }
+
+        internal static string Summary(SuccessSnapshot success, bool unavailable, RunRecord last, bool attemptUnavailable)
+        {
+            string text = success == null ? (unavailable ? "最近成功记录暂不可用，请检查日志目录权限。" : "尚无成功联通记录。")
+                : "最近一次成功联通：" + LocalTime(success.FinishedAtUtc) + " · " + (success.Source == "manual" ? "手动测试" : "计划执行")
+                    + "\r\n" + (string.IsNullOrWhiteSpace(success.FinalModel) ? "未确认实际响应模型" : "实际响应模型：" + success.FinalModel)
+                    + "\r\n实际链路：" + (string.IsNullOrWhiteSpace(success.Route) ? "未确认" : success.Route);
+            if (attemptUnavailable) text += "\r\n最近尝试记录暂不可用，请查看日志。";
+            else if (last != null && last.Success && !TimelineExecutionPolicy.BusinessSuccess(last))
+                text += "\r\n最近尝试结果未确认，请查看执行详情。";
+            else if (last != null && !last.Success)
+                text += "\r\n最近尝试失败：" + LocalTime(last.FinishedAt) + "\r\n原因：" + FailureReason(last)
+                    + "\r\n下一步：" + RouteTestPresentation.FailureNextStep(last);
+            return text;
+        }
+
+        private static string LocalTime(string value)
+        {
+            DateTimeOffset time;
+            return Time(value, out time) ? time.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "时间未确认";
+        }
+
+        private static string FailureReason(RunRecord last)
+        {
+            // A bounded vocabulary avoids exposing credentials embedded in remote errors.
+            string error = last.Error ?? "";
+            if (error.Contains("超时")) return "请求超时";
+            if (error.Contains("网络")) return "网络未恢复";
+            if (error.Contains("找不到 Codex CLI")) return "找不到 Codex CLI";
+            if (error.Contains("最终模型回复")) return "未收到有效模型回复";
+            if (error.Contains("正在运行")) return "已有请求正在运行，本次跳过";
+            if (error.Contains("暂停")) return "计划已暂停，本次跳过";
+            return "请求未成功（退出码 " + last.ExitCode.ToString(CultureInfo.InvariantCulture) + "），请查看执行详情";
+        }
+    }
+
+    internal static class RecentSuccessChecks
+    {
+        internal static RunRecord Fixture(string mode, DateTimeOffset finished)
+        {
+            return new RunRecord { Mode = mode, StartedAt = finished.AddSeconds(-20).ToString("o"), FinishedAt = finished.ToString("o"),
+                Success = true, ExitCode = 0, AttemptCount = 1, Output = "fixture reply", FinalModel = "gpt-6-luna",
+                RouteType = "direct", RouteSummary = "fixture", Error = "Bearer secret-cookie", Model = "requested-model" };
+        }
+
+        // Invoked by isolated Windows PowerShell children to test the actual cross-process mutex.
+        internal static void WriteFixture(string directory, int index)
+        {
+            string root = Path.GetFullPath(Path.GetTempPath());
+            string full = Path.GetFullPath(directory);
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                || !Path.GetFileName(full).StartsWith("CodexQuotaWaker-Results-", StringComparison.Ordinal)) throw new InvalidOperationException();
+            DateTimeOffset time = DateTimeOffset.Parse("2026-01-01T01:00:00Z", CultureInfo.InvariantCulture).AddMinutes(index);
+            for (int i = 0; i < 12; i++) RecentSuccessStore.SaveAttempt(Path.Combine(full, "attempt.json"),
+                Path.Combine(full, "concurrent.json"), Fixture(index == 0 ? "manual" : "scheduled", time));
+        }
+
+        internal static bool Verify(out string evidence)
+        {
+            List<string> checks = new List<string>();
+            bool ok = true;
+            Action<string, bool> check = delegate(string name, bool value) { checks.Add(name + "=" + value); ok &= value; };
+            string directory = Path.Combine(Path.GetTempPath(), "CodexQuotaWaker-Results-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string successPath = Path.Combine(directory, "success.json"), attemptPath = Path.Combine(directory, "last.json");
+            bool unavailable;
+            DateTimeOffset now = DateTimeOffset.UtcNow.AddHours(-1);
+            try
+            {
+                RunRecord manual = Fixture("manual", now), scheduled = Fixture("scheduled", now.AddMinutes(1));
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, manual);
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, scheduled);
+                SuccessSnapshot read = RecentSuccessStore.Read(successPath, out unavailable);
+                check("manualThenScheduled", read.Source == "scheduled" && read.FinishedAtUtc == scheduled.FinishedAt);
+                manual.FinishedAt = now.AddMinutes(2).ToString("o");
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, manual);
+                check("scheduledThenManual", RecentSuccessStore.Read(successPath, out unavailable).Source == "manual");
+                RunRecord failure = Fixture("scheduled", now.AddMinutes(3)); failure.Success = false; failure.ExitCode = 1;
+                failure.FinalModel = "gpt-other-failure"; failure.RouteType = "custom"; failure.Error = "网络超时 Bearer secret-cookie";
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, failure);
+                read = RecentSuccessStore.Read(successPath, out unavailable);
+                string summary = RecentSuccessStore.Summary(read, false, failure, false);
+                check("failurePreservesSuccessAndSeparatesAttempt", read.Source == "manual" && summary.Contains("手动测试")
+                    && summary.Contains("最近尝试失败") && summary.Contains("下一步") && !summary.Contains("gpt-other-failure") && !summary.Contains("secret-cookie"));
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, scheduled);
+                check("olderDoesNotOverwriteEitherRecord", RecentSuccessStore.Read(successPath, out unavailable).Source == "manual"
+                    && JsonStore.Deserialize<RunRecord>(RecentSuccessStore.ReadText(attemptPath)).ExitCode == 1);
+                RunRecord unknownModel = Fixture("scheduled", now.AddMinutes(4)); unknownModel.FinalModel = "";
+                RecentSuccessStore.SaveAttempt(attemptPath, successPath, unknownModel);
+                read = RecentSuccessStore.Read(successPath, out unavailable);
+                check("unknownModelStillSucceeds", RecentSuccessStore.Summary(read, false, unknownModel, false).Contains("未确认实际响应模型"));
+                string persisted = File.ReadAllText(successPath);
+                check("minimalSafeSnapshot", !persisted.Contains("fixture reply") && !persisted.Contains("secret-cookie") && !persisted.Contains("requested-model"));
+                foreach (int invalid in new[] { 0, 1, 2, 3 })
+                {
+                    RunRecord invalidRun = Fixture("manual", now.AddMinutes(5));
+                    if (invalid == 0) invalidRun.ExitCode = 1;
+                    if (invalid == 1) invalidRun.Output = "";
+                    if (invalid == 2) invalidRun.Output = "已收到 Codex 结构化响应";
+                    if (invalid == 3) invalidRun.AttemptCount = 0;
+                    RecentSuccessStore.SaveAttempt(attemptPath, successPath, invalidRun);
+                }
+                check("invalidBusinessEvidenceRejected", File.ReadAllText(successPath) == persisted);
+                string migration = Path.Combine(directory, "migration.json");
+                read = RecentSuccessStore.Recover(migration, scheduled, null, out unavailable);
+                string migrationBefore = File.ReadAllText(migration);
+                RecentSuccessStore.Recover(migration, scheduled, null, out unavailable);
+                check("legacySuccessMigratesIdempotently", read.Source == "scheduled" && migrationBefore == File.ReadAllText(migration));
+                string empty = Path.Combine(directory, "empty.json");
+                check("failureCannotInventSuccess", RecentSuccessStore.Recover(empty, failure, null, out unavailable) == null && !File.Exists(empty));
+                List<TimelineExecution> history = new List<TimelineExecution> { new TimelineExecution { State = "success", ExitCode = 0,
+                    RunId = "trusted", PlanKey = "same-plan", PlannedTime = "2026-01-01 00:00", StartedAt = now.ToString("o"), FinishedAt = now.AddMinutes(6).ToString("o") } };
+                read = RecentSuccessStore.Recover(empty, failure, history, out unavailable);
+                check("timelineMigrationDoesNotBorrowFields", read.Source == "scheduled" && read.FinalModel == "" && read.Route == ""
+                    && RecentSuccessStore.Summary(read, false, failure, false).Contains("实际链路：未确认"));
+                File.WriteAllText(empty, "{broken");
+                check("corruptionIsUnavailable", RecentSuccessStore.Recover(empty, failure, null, out unavailable) == null && unavailable);
+                check("unknownNotFailure", RecentSuccessStore.Summary(null, true, null, true).Contains("暂不可用")
+                    && !RecentSuccessStore.Summary(null, true, null, true).Contains("失败"));
+                File.WriteAllText(empty, JsonStore.Serialize(new SuccessSnapshot { FinishedAtUtc = now.ToString("o"), Source = "scheduled", EvidenceId = "unproven" }));
+                check("invalidSnapshotRejected", RecentSuccessStore.Read(empty, out unavailable) == null && unavailable);
+
+                string executable = Assembly.GetExecutingAssembly().Location;
+                List<Process> workers = new List<Process>();
+                try
+                {
+                    for (int index = 1; index >= 0; index--)
+                    {
+                        string script = "$ErrorActionPreference='Stop'; $a=[Reflection.Assembly]::LoadFrom('" + executable.Replace("'", "''")
+                            + "'); $t=$a.GetType('CodexQuotaWaker.RecentSuccessChecks'); $m=$t.GetMethod('WriteFixture',[Reflection.BindingFlags]'Static,NonPublic');"
+                            + " $m.Invoke($null,[object[]]@('" + directory.Replace("'", "''") + "',[int]" + index + ")) | Out-Null";
+                        ProcessStartInfo info = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                            "WindowsPowerShell\\v1.0\\powershell.exe"), "-NoProfile -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)));
+                        info.UseShellExecute = false; info.CreateNoWindow = true; info.WindowStyle = ProcessWindowStyle.Hidden;
+                        workers.Add(Process.Start(info));
+                    }
+                    bool readersOk = true;
+                    Stopwatch waiting = Stopwatch.StartNew();
+                    while (workers.Any(delegate(Process worker) { return !worker.HasExited; }) && waiting.ElapsedMilliseconds < 20000)
+                    {
+                        bool readUnavailable;
+                        RecentSuccessStore.Read(Path.Combine(directory, "concurrent.json"), out readUnavailable);
+                        readersOk &= !readUnavailable;
+                        Thread.Sleep(10);
+                    }
+                    bool workersOk = true;
+                    foreach (Process worker in workers) workersOk &= worker.WaitForExit(20000) && worker.ExitCode == 0;
+                    read = RecentSuccessStore.Read(Path.Combine(directory, "concurrent.json"), out unavailable);
+                    check("crossProcessAtomicLatestWinsAndRestart", readersOk && workersOk && read != null && read.Source == "scheduled"
+                        && DateTimeOffset.Parse(read.FinishedAtUtc).Minute == 1
+                        && JsonStore.Deserialize<RunRecord>(RecentSuccessStore.ReadText(Path.Combine(directory, "attempt.json"))).Mode == "scheduled");
+                }
+                finally { foreach (Process worker in workers) { if (!worker.HasExited) worker.Kill(); worker.Dispose(); } }
+            }
+            catch (Exception ex) { check("exception:" + ex.GetType().Name, false); }
+            finally
+            {
+                string full = Path.GetFullPath(directory);
+                if (full.StartsWith(Path.GetFullPath(Path.GetTempPath()), StringComparison.OrdinalIgnoreCase)
+                    && Path.GetFileName(full).StartsWith("CodexQuotaWaker-Results-", StringComparison.Ordinal)) Directory.Delete(full, true);
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+    }
+
     internal static class JsonStore
     {
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
@@ -399,7 +738,7 @@ namespace CodexQuotaWaker
                 {
                     return null;
                 }
-                return Serializer.Deserialize<RunRecord>(File.ReadAllText(AppPaths.LastRunPath, Encoding.UTF8));
+                return new JavaScriptSerializer().Deserialize<RunRecord>(RecentSuccessStore.ReadText(AppPaths.LastRunPath));
             }
             catch (Exception ex)
             {
@@ -410,8 +749,7 @@ namespace CodexQuotaWaker
 
         public static void SaveLastRun(RunRecord record)
         {
-            AppPaths.EnsureDirectories();
-            File.WriteAllText(AppPaths.LastRunPath, Serializer.Serialize(record), new UTF8Encoding(false));
+            RecentSuccessStore.SaveAttempt(AppPaths.LastRunPath, AppPaths.LastSuccessPath, record);
         }
 
         public static string Serialize(object value)
@@ -5192,6 +5530,16 @@ namespace CodexQuotaWaker
                 lines.Add("VisibleAppVersionEvidence=" + visibleVersionEvidence);
                 lines.Add("VisibleAppVersion=" + visibleVersionOk);
                 success = success && visibleVersionOk;
+                string recentSuccessEvidence;
+                bool recentSuccessOk = RecentSuccessChecks.Verify(out recentSuccessEvidence);
+                lines.Add("RecentSuccessEvidence=" + recentSuccessEvidence);
+                lines.Add("RecentSuccessPersistence=" + recentSuccessOk);
+                success = success && recentSuccessOk;
+                string recentSuccessLayoutEvidence;
+                bool recentSuccessLayoutOk = MainForm.VerifyRecentSuccessLayout(out recentSuccessLayoutEvidence);
+                lines.Add("RecentSuccessLayoutEvidence=" + recentSuccessLayoutEvidence);
+                lines.Add("RecentSuccessLayout=" + recentSuccessLayoutOk);
+                success = success && recentSuccessLayoutOk;
                 string timelineContinuityEvidence;
                 bool timelineContinuityOk = TimelineContinuityChecks.Verify(out timelineContinuityEvidence);
                 lines.Add("TimelineContinuityEvidence=" + timelineContinuityEvidence);
@@ -5461,6 +5809,8 @@ namespace CodexQuotaWaker
         private readonly Panel heroCard;
         private readonly Label brandVersionLabel;
         private readonly Label brandSubtitleLabel;
+        private readonly SplitContainer resultsSplit;
+        private bool adjustingResultsSplit;
         private readonly FlowLayoutPanel leftStack;
         private readonly FlowLayoutPanel rightStack;
         private readonly Label nextRunLabel;
@@ -5774,13 +6124,16 @@ namespace CodexQuotaWaker
 
             Panel resultBody;
             Panel resultCard = NewCard("最近一次结果", out resultBody, 260);
-            resultSummaryLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
+            resultSummaryLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
             resultBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, BackColor = Color.FromArgb(248, 247, 250), Font = new Font("Microsoft YaHei UI", 9F), BorderStyle = BorderStyle.FixedSingle, Visible = false };
-            resultDetailsButton = NewButton("查看执行详情", false);
+            resultDetailsButton = NewButton("查看最近尝试详情", false);
             resultDetailsButton.Dock = DockStyle.Bottom;
             resultDetailsButton.Click += delegate { ToggleResultDetails(); };
             resultBody.Controls.Add(resultBox);
-            resultBody.Controls.Add(resultSummaryLabel);
+            Panel resultSummaryViewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+            resultSummaryViewport.Controls.Add(resultSummaryLabel);
+            resultSummaryLabel.SizeChanged += delegate { resultSummaryViewport.AutoScrollMinSize = new Size(0, resultSummaryLabel.Height); };
+            resultBody.Controls.Add(resultSummaryViewport);
             resultBody.Controls.Add(resultDetailsButton);
 
             SplitContainer dataSplit = new SplitContainer
@@ -5803,6 +6156,9 @@ namespace CodexQuotaWaker
             resultCard.Dock = DockStyle.Fill;
             dataSplit.Panel1.Controls.Add(timelineCard);
             dataSplit.Panel2.Controls.Add(resultCard);
+            resultsSplit = dataSplit;
+            resultSummaryLabel.SizeChanged += delegate { UpdateResultPanelMinimum(); };
+            dataSplit.Resize += delegate { UpdateResultPanelMinimum(); };
             rightStack.Controls.Add(dataSplit);
 
             Panel installedBody;
@@ -5914,7 +6270,7 @@ namespace CodexQuotaWaker
             rightStack.Height = StackHeight(rightStack);
             routeDetailLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
             modelCatalogFeedbackLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
-            resultSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
+            resultSummaryLabel.MaximumSize = new Size(Math.Max(120, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
             installedSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
             planDetailLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
             sequenceSummaryLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
@@ -6290,7 +6646,8 @@ namespace CodexQuotaWaker
             resultDetailsExpanded = !resultDetailsExpanded;
             resultBox.Visible = resultDetailsExpanded;
             resultSummaryLabel.Visible = !resultDetailsExpanded;
-            resultDetailsButton.Text = resultDetailsExpanded ? "收起执行详情" : "查看执行详情";
+            resultSummaryLabel.Parent.Visible = !resultDetailsExpanded;
+            resultDetailsButton.Text = resultDetailsExpanded ? "收起最近尝试详情" : "查看最近尝试详情";
         }
 
         internal static bool VerifyPresentation(out string geometryEvidence)
@@ -6653,6 +7010,74 @@ namespace CodexQuotaWaker
             }
         }
 
+        internal static bool VerifyRecentSuccessLayout(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            foreach (int width in new[] { 1420, 760 })
+            foreach (float scale in new[] { 1F, 1.5F })
+            using (MainForm form = new MainForm())
+            {
+                if (scale != 1F)
+                {
+                    form.Scale(new SizeF(scale, scale));
+                    form.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                    form.resultSummaryLabel.Font = new Font("Microsoft YaHei UI", 10F * scale);
+                }
+                form.ClientSize = new Size(width, 880);
+                IntPtr handle = form.Handle;
+                EnsureControlHandles(form);
+                typeof(Form).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { EventArgs.Empty });
+                form.LayoutResponsive();
+                DateTimeOffset now = DateTimeOffset.UtcNow.AddHours(-1);
+                RunRecord success = RecentSuccessChecks.Fixture("manual", now);
+                RunRecord failure = RecentSuccessChecks.Fixture("scheduled", now.AddMinutes(1));
+                failure.Success = false; failure.ExitCode = 1; failure.Error = "网络超时"; failure.FinalModel = "gpt-failure-model";
+                foreach (int scenario in new[] { 0, 1, 2, 3 })
+                {
+                    RunRecord latest = scenario == 0 || scenario == 3 ? null : scenario == 1 ? success : failure;
+                    form.SetRecentResultSummary(scenario == 1 || scenario == 2 ? RecentSuccessStore.FromRun(success) : null,
+                        scenario == 3, latest, scenario == 3);
+                    form.SetLatestAttemptDetails(latest);
+                    form.UpdateResultPanelMinimum();
+                    PerformLayoutTree(form);
+                    Panel panel = (Panel)form.resultSummaryLabel.Parent;
+                    Size preferred = form.resultSummaryLabel.GetPreferredSize(new Size(form.resultSummaryLabel.MaximumSize.Width, 0));
+                    Rectangle panelBounds = BoundsInAncestor(panel, form.resultDetailsButton.Parent);
+                    bool readable = form.resultSummaryLabel.Height >= preferred.Height
+                        && form.resultSummaryLabel.Width <= panel.ClientSize.Width
+                        && panelBounds.Bottom <= form.resultDetailsButton.Top && panel.AutoScroll;
+                    if (form.resultSummaryLabel.Height > panel.ClientSize.Height)
+                    {
+                        panel.AutoScrollPosition = new Point(0, form.resultSummaryLabel.Height);
+                        checks.Add("scroll:" + width + "/" + scale + ",offset=" + panel.AutoScrollPosition
+                            + ",label=" + FormatBounds(form.resultSummaryLabel.Bounds) + ",min=" + panel.AutoScrollMinSize
+                            + ",vertical=" + panel.VerticalScroll.Visible);
+                        readable &= panel.ClientRectangle.IntersectsWith(form.resultSummaryLabel.Bounds)
+                            && form.resultSummaryLabel.Bottom <= panel.ClientSize.Height;
+                        panel.AutoScrollPosition = Point.Empty;
+                    }
+                    bool detail = form.resultDetailsButton.Enabled == (latest != null);
+                    if (latest != null)
+                    {
+                        form.ToggleResultDetails();
+                        PerformLayoutTree(form);
+                        detail &= form.resultDetailsExpanded && form.resultDetailsButton.Text.Contains("最近尝试")
+                            && form.resultBox.Bottom <= form.resultDetailsButton.Top;
+                        if (scenario == 2) detail &= form.resultBox.Text.Contains("gpt-failure-model") && form.resultBox.Text.Contains("网络超时")
+                            && form.resultSummaryLabel.Text.Contains("gpt-6-luna") && !form.resultSummaryLabel.Text.Contains("gpt-failure-model");
+                        form.ToggleResultDetails();
+                    }
+                    checks.Add(width + "/" + scale + "/" + scenario + ":readable=" + readable + ",latestDetails=" + detail
+                        + ",label=" + FormatBounds(form.resultSummaryLabel.Bounds) + ",panel=" + FormatBounds(panel.ClientRectangle)
+                        + ",split=" + form.resultsSplit.Height + "/" + form.resultsSplit.SplitterDistance + "/" + form.resultsSplit.Panel2MinSize);
+                    ok &= readable && detail;
+                }
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+
         internal static bool VerifyVisibleVersion(out string evidence)
         {
             bool ok = true;
@@ -6854,9 +7279,9 @@ namespace CodexQuotaWaker
                 bool installedCollapses = !form.installedDetailsExpanded && form.rightStack.Controls[1].Height == installedHeight;
 
                 form.ToggleResultDetails();
-                bool resultExpands = form.resultDetailsExpanded && form.resultDetailsButton.Text == "收起执行详情";
+                bool resultExpands = form.resultDetailsExpanded && form.resultDetailsButton.Text == "收起最近尝试详情";
                 form.ToggleResultDetails();
-                bool resultCollapses = !form.resultDetailsExpanded && form.resultDetailsButton.Text == "查看执行详情";
+                bool resultCollapses = !form.resultDetailsExpanded && form.resultDetailsButton.Text == "查看最近尝试详情";
 
                 form.sequenceSchedulePanel.ScrollControlIntoView(form.saveButton);
                 PerformLayoutTree(form);
@@ -7275,19 +7700,19 @@ namespace CodexQuotaWaker
             saveButton.Text = taskStatus.Exists ? "更新并启用计划  ↗" : "保存并启用计划  ↗";
             if (hasUnsavedChanges) UpdateDraftTimeline(now);
             else UpdateTimeline(now);
+            bool successUnavailable;
+            SuccessSnapshot recentSuccess = RecentSuccessStore.LoadForApplication(last, out successUnavailable);
+            SetRecentResultSummary(recentSuccess, successUnavailable, last, last == null && File.Exists(AppPaths.LastRunPath));
+            SetLatestAttemptDetails(last);
+        }
+
+        private void SetLatestAttemptDetails(RunRecord last)
+        {
             if (last == null)
             {
-                resultSummaryLabel.Text = "尚未执行请求。点击“测试请求”后，这里会显示链路状态和最终模型。";
-                resultDetailsButton.Enabled = false;
                 resultBox.Text = "暂无运行记录。";
                 return;
             }
-            resultDetailsButton.Enabled = true;
-            resultSummaryLabel.ForeColor = last.Success ? Color.FromArgb(28, 125, 80) : Color.FromArgb(180, 55, 55);
-            resultSummaryLabel.Text = RouteTestPresentation.LinkStatus(last) + "  ·  " + FormatIso(last.FinishedAt)
-                + "\r\n" + RouteTestPresentation.FinalModelLabel(last)
-                + "\r\n实际链路：" + RouteTestPresentation.RouteSummary(last)
-                + (last.Success ? string.Empty : "\r\n下一步：" + RouteTestPresentation.FailureNextStep(last));
             StringBuilder result = new StringBuilder();
             result.AppendLine("请求状态：" + RouteTestPresentation.LinkStatus(last));
             result.AppendLine("模式：" + last.Mode);
@@ -7341,6 +7766,39 @@ namespace CodexQuotaWaker
                 result.AppendLine(last.Error);
             }
             resultBox.Text = result.ToString();
+        }
+
+        private void SetRecentResultSummary(SuccessSnapshot success, bool unavailable, RunRecord last, bool attemptUnavailable)
+        {
+            string summary = RecentSuccessStore.Summary(success, unavailable, last, attemptUnavailable);
+            if (resultSummaryLabel.Text != summary)
+            {
+                ((Panel)resultSummaryLabel.Parent).AutoScrollPosition = Point.Empty;
+                resultSummaryLabel.Text = summary;
+            }
+            resultSummaryLabel.ForeColor = Ink;
+            resultDetailsButton.Enabled = last != null;
+            resultDetailsButton.Text = resultDetailsExpanded ? "收起最近尝试详情" : "查看最近尝试详情";
+            UpdateResultPanelMinimum();
+        }
+
+        private void UpdateResultPanelMinimum()
+        {
+            if (resultsSplit == null || adjustingResultsSplit) return;
+            adjustingResultsSplit = true;
+            try
+            {
+                Control body = resultDetailsButton.Parent;
+                int chrome = Math.Max(0, resultsSplit.Panel2.ClientSize.Height - body.Height);
+                int minimum = Math.Max((int)(resultsSplit.Panel1MinSize * 190.0 / 180.0),
+                    resultSummaryLabel.Height + resultDetailsButton.Height + chrome + 8);
+                int total = resultsSplit.Panel1MinSize + resultsSplit.SplitterWidth + minimum;
+                if (resultsSplit.Height < total) resultsSplit.Height = total;
+                if (resultsSplit.Height - resultsSplit.SplitterDistance - resultsSplit.SplitterWidth < minimum)
+                    resultsSplit.SplitterDistance = Math.Max(resultsSplit.Panel1MinSize, resultsSplit.Height - minimum - resultsSplit.SplitterWidth);
+                resultsSplit.Panel2MinSize = minimum;
+            }
+            finally { adjustingResultsSplit = false; }
         }
 
         private string DescribeInstalledPlan(DateTime? next, WindowsTaskStatus taskStatus, RunRecord last)
