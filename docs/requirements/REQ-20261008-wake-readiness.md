@@ -1,6 +1,6 @@
 # WAKE-001：离开前检查计划唤醒条件
 
-- 状态：implementation_verified / awaiting_deployment；2026-10-08 用户回复 `0`，批准本版需求与 `gpt-6-luna / max` 开发档位，已交付原开发聊天
+- 状态：implementation_completed / awaiting_acceptance；2026-10-08 用户回复 `0`，批准本版需求与 `gpt-6-luna / max` 开发档位，已完成固定路径交付
 - 优先级：P1；来源：用户询问合盖、睡眠与电池状态下能否正常唤醒（2026-10-07），并接受软件内检查与设置指引方向
 - 用户目标：设好计划后，直接知道当前电脑在哪种供电/登录条件下可能无法按时运行，以及自己下一步该检查哪里
 
@@ -51,4 +51,7 @@
 - 验证：`scripts/build.ps1` 与 `scripts/verify.ps1 -ExePath .\dist\CodexQuotaWaker-wake-validation.exe` 通过，新增 `WakeReadiness` 与 `WakeReadinessLayout` 检查通过，`git diff --check` 通过。临时验证 EXE SHA-256：`F4EB607D1248DEA706F5442E3354D6E13953F28776C0A4B2AE56867D9320686D`。验证前后固定启动 EXE、安装后台 EXE、唯一计划任务 XML、应用数据和电源设置均未变化；验证用临时任务已移除。
 - 实现提交：`6c3743b`（`feat: add pre-sleep wake readiness checks`）；本事件与权威验收证据保存在此需求文件。
 - 协作反馈：已将本事件、验证/部署状态和下一步发送至产品任务 `01a1012e-b555-7490-a340-5264a4da3c7b`；消息工具返回同一 `threadId`，送达状态 `sent`。
+- 事件 `WAKE-001-20261008-delivered`（开发 turn `01a11946-53e2-7592-a4f1-dea4aa244c4d`）：阻塞窗口退出后，已按项目固定路径构建并验证 `dist\CodexQuotaWaker.exe`，随后更新任务引用的 `%LOCALAPPDATA%\CodexQuotaWaker\CodexQuotaWaker.exe`。两份 EXE 均为 `ProductVersion=0.19.0`、247296 bytes、SHA-256 `581C58D8B21D001511122D97D7F88BE0D4A4805A05D9051217242F14CF562018`。本地 tag `v0.19.0` 指向发布代码提交 `6c3743bdbb31d6faf498cb5ae2c1d903a40e0d01`，未 push。
+- 正式交付后复核：计划 `CodexQuotaWaker-Schedule` 仍为 Ready，动作路径、参数 `--run-scheduled --plan-version 70ed607765ef4782b5c185d56e83f55b` 及计划 XML SHA-256 `3D28741D764E664212A35978CEA8EA1E65F23649E0B6239F0E593CDEEAA8C30F` 与交付前一致；应用 EXE 以外的 6 个配置/结果/日志文件哈希不变；活动电源方案及 S3/S4、睡眠和合盖设置查询 SHA-256 `A67A6163463F21BA7B74352350344FF0930C65993B5169FEA4D11E588A46C72C` 不变。`scripts/build.ps1`、`scripts/verify.ps1`（全部自检、`WakeReadiness`、`WakeReadinessLayout`、任务注册与清理）和 `git diff --check` 均通过。无残留集成测试任务或额度唤醒器进程。
+- 未执行桌面视觉验收、真实 Codex 请求或实机睡眠/合盖唤醒演练；这些不在本次已批准的开发验证内，需求等待用户验收。
 - 当前状态：实现和验证已完成，正式固定路径尚未更新。主窗口 PID `15968`（`dist\CodexQuotaWaker.exe`，0.18.0）仍有有效窗口句柄；不结束该进程、不覆盖其映像。无活动构建/验证命令或子代理。下一步由用户关闭该旧窗口，开发复核进程退出后，将 0.19.0 同步更新至固定启动 EXE 与计划引用的 `%LOCALAPPDATA%\CodexQuotaWaker\CodexQuotaWaker.exe`，随后复验任务与用户数据不变；无桌面控制、真实 Codex 请求、睡眠/唤醒演练或 push。
