@@ -25,9 +25,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.18.0.0")]
-[assembly: AssemblyFileVersion("0.18.0.0")]
-[assembly: AssemblyInformationalVersion("0.18.0")]
+[assembly: AssemblyVersion("0.19.0.0")]
+[assembly: AssemblyFileVersion("0.19.0.0")]
+[assembly: AssemblyInformationalVersion("0.19.0")]
 
 namespace CodexQuotaWaker
 {
@@ -4572,7 +4572,593 @@ namespace CodexQuotaWaker
 
         public bool CanRunWithoutLogon
         {
-            get { return string.Equals(LogonType, "Password", StringComparison.OrdinalIgnoreCase); }
+            get
+            {
+                return string.Equals(LogonType, "Password", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(LogonType, "S4U", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(LogonType, "ServiceAccount", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+    }
+
+    internal sealed class WakeTaskInspection
+    {
+        public bool Missing { get; set; }
+        public bool? Exists { get; set; }
+        public bool? Enabled { get; set; }
+        public bool? WakeToRun { get; set; }
+        public string LogonType { get; set; }
+        public string Error { get; set; }
+    }
+
+    internal enum CurrentPowerSource
+    {
+        Unknown,
+        PluggedIn,
+        Battery
+    }
+
+    internal sealed class WakeSystemSnapshot
+    {
+        public DateTimeOffset CheckedAt { get; set; }
+        public CurrentPowerSource PowerSource { get; set; }
+        public string PowerSourceError { get; set; }
+        public Guid? ActiveSchemeId { get; set; }
+        public string ActiveSchemeName { get; set; }
+        public string SchemeError { get; set; }
+        public int? WakeTimerAc { get; set; }
+        public int? WakeTimerDc { get; set; }
+        public string WakeTimerAcError { get; set; }
+        public string WakeTimerDcError { get; set; }
+        public bool? WakeTimerVisible { get; set; }
+        public string WakeTimerVisibilityError { get; set; }
+        public bool? LidPresent { get; set; }
+        public int? LidActionAc { get; set; }
+        public int? LidActionDc { get; set; }
+        public bool? LidActionVisible { get; set; }
+        public string LidVisibilityError { get; set; }
+        public string LidError { get; set; }
+        public bool? SupportsSleep { get; set; }
+        public bool? SupportsHibernate { get; set; }
+        public bool? SupportsModernStandby { get; set; }
+        public string SleepStates { get; set; }
+        public int? RtcWakeState { get; set; }
+        public string CapabilityError { get; set; }
+    }
+
+    internal sealed class WakeReadinessView
+    {
+        public string MainSummary { get; set; }
+        public string Details { get; set; }
+        public bool ShowPowerSettings { get; set; }
+        public string CheckedAt { get; set; }
+    }
+
+    internal static class WakeSystemReader
+    {
+        private static readonly Guid SleepSubgroup = new Guid("238c9fa8-0aad-41ed-83f4-97be242c8f20");
+        private static readonly Guid WakeTimerSetting = new Guid("bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d");
+        private static readonly Guid ButtonsSubgroup = new Guid("4f971e89-eebd-4455-a8de-9e59040e7347");
+        private static readonly Guid LidActionSetting = new Guid("5ca83367-6e45-459f-a27b-476b1d01c936");
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SystemPowerStatus
+        {
+            public byte AcLineStatus;
+            public byte BatteryFlag;
+            public byte BatteryLifePercent;
+            public byte SystemStatusFlag;
+            public uint BatteryLifeTime;
+            public uint BatteryFullLifeTime;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
+
+        [DllImport("powrprof.dll")]
+        private static extern uint PowerGetActiveScheme(IntPtr userRootPowerKey, out IntPtr activePolicyGuid);
+
+        [DllImport("powrprof.dll")]
+        private static extern uint PowerReadACValueIndex(IntPtr rootPowerKey, ref Guid schemeGuid,
+            ref Guid subgroupGuid, ref Guid settingGuid, out uint valueIndex);
+
+        [DllImport("powrprof.dll")]
+        private static extern uint PowerReadDCValueIndex(IntPtr rootPowerKey, ref Guid schemeGuid,
+            ref Guid subgroupGuid, ref Guid settingGuid, out uint valueIndex);
+
+        [DllImport("powrprof.dll")]
+        private static extern uint PowerReadSettingAttributes(ref Guid subgroupGuid, ref Guid settingGuid);
+
+        [DllImport("powrprof.dll")]
+        private static extern uint PowerReadFriendlyName(IntPtr rootPowerKey, ref Guid schemeGuid,
+            IntPtr subgroupGuid, IntPtr settingGuid, IntPtr buffer, ref uint bufferSize);
+
+        [DllImport("powrprof.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool GetPwrCapabilities(IntPtr capabilities);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        public static WakeSystemSnapshot Read()
+        {
+            WakeSystemSnapshot snapshot = new WakeSystemSnapshot { CheckedAt = DateTimeOffset.Now, PowerSource = CurrentPowerSource.Unknown };
+            try
+            {
+                SystemPowerStatus status;
+                if (!GetSystemPowerStatus(out status)) snapshot.PowerSourceError = Win32Error(Marshal.GetLastWin32Error());
+                else if (status.AcLineStatus == 1) snapshot.PowerSource = CurrentPowerSource.PluggedIn;
+                else if (status.AcLineStatus == 0 && status.BatteryFlag != 128) snapshot.PowerSource = CurrentPowerSource.Battery;
+                else snapshot.PowerSourceError = "Windows 未报告明确的插电或电池状态。";
+            }
+            catch (Exception ex) { snapshot.PowerSourceError = ReadError(ex); }
+
+            try
+            {
+                IntPtr schemePointer;
+                uint result = PowerGetActiveScheme(IntPtr.Zero, out schemePointer);
+                if (result != 0) snapshot.SchemeError = Win32Error((int)result);
+                else
+                {
+                    try
+                    {
+                        Guid scheme = (Guid)Marshal.PtrToStructure(schemePointer, typeof(Guid));
+                        snapshot.ActiveSchemeId = scheme;
+                        snapshot.ActiveSchemeName = ReadSchemeName(scheme);
+                        string settingError;
+                        snapshot.WakeTimerVisible = ReadSettingVisible(SleepSubgroup, WakeTimerSetting, out settingError);
+                        snapshot.WakeTimerVisibilityError = settingError;
+                        snapshot.LidActionVisible = ReadSettingVisible(ButtonsSubgroup, LidActionSetting, out settingError);
+                        snapshot.LidVisibilityError = settingError;
+                        snapshot.WakeTimerAc = ReadSetting(scheme, SleepSubgroup, WakeTimerSetting, true, out settingError);
+                        snapshot.WakeTimerAcError = settingError;
+                        snapshot.WakeTimerDc = ReadSetting(scheme, SleepSubgroup, WakeTimerSetting, false, out settingError);
+                        snapshot.WakeTimerDcError = settingError;
+                        snapshot.LidActionAc = ReadSetting(scheme, ButtonsSubgroup, LidActionSetting, true, out settingError);
+                        snapshot.LidError = settingError;
+                        string dcError;
+                        snapshot.LidActionDc = ReadSetting(scheme, ButtonsSubgroup, LidActionSetting, false, out dcError);
+                        if (string.IsNullOrWhiteSpace(snapshot.LidError)) snapshot.LidError = dcError;
+                    }
+                    finally { LocalFree(schemePointer); }
+                }
+            }
+            catch (Exception ex) { snapshot.SchemeError = ReadError(ex); }
+
+            ReadCapabilities(snapshot);
+            return snapshot;
+        }
+
+        private static int? ReadSetting(Guid scheme, Guid subgroup, Guid setting, bool ac, out string error)
+        {
+            uint value;
+            uint status = ac
+                ? PowerReadACValueIndex(IntPtr.Zero, ref scheme, ref subgroup, ref setting, out value)
+                : PowerReadDCValueIndex(IntPtr.Zero, ref scheme, ref subgroup, ref setting, out value);
+            error = status != 0 ? Win32Error((int)status) : value > 100 ? "Windows 返回了无法识别的设置值。" : "";
+            return status == 0 && value <= 100 ? (int?)value : null;
+        }
+
+        private static bool? ReadSettingVisible(Guid subgroup, Guid setting, out string error)
+        {
+            try
+            {
+                const uint PowerAttributeHide = 1;
+                uint attributes = PowerReadSettingAttributes(ref subgroup, ref setting);
+                error = "";
+                return (attributes & PowerAttributeHide) == 0;
+            }
+            catch (Exception ex)
+            {
+                error = ReadError(ex);
+                return null;
+            }
+        }
+
+        private static string ReadSchemeName(Guid scheme)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(1024);
+            try
+            {
+                uint size = 1024;
+                uint status = PowerReadFriendlyName(IntPtr.Zero, ref scheme, IntPtr.Zero, IntPtr.Zero, buffer, ref size);
+                return status == 0 ? Marshal.PtrToStringUni(buffer) : "";
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        private static void ReadCapabilities(WakeSystemSnapshot snapshot)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(256);
+            try
+            {
+                Marshal.Copy(new byte[256], 0, buffer, 256);
+                if (!GetPwrCapabilities(buffer)) { snapshot.CapabilityError = Win32Error(Marshal.GetLastWin32Error()); return; }
+                bool s1 = Marshal.ReadByte(buffer, 3) != 0;
+                bool s2 = Marshal.ReadByte(buffer, 4) != 0;
+                bool s3 = Marshal.ReadByte(buffer, 5) != 0;
+                bool s4 = Marshal.ReadByte(buffer, 6) != 0;
+                snapshot.LidPresent = Marshal.ReadByte(buffer, 2) != 0;
+                // SYSTEM_POWER_CAPABILITIES marks AoAc after 22 bytes of fixed BOOLEAN/BYTE fields.
+                snapshot.SupportsModernStandby = Marshal.ReadByte(buffer, 20) != 0;
+                snapshot.SupportsSleep = s1 || s2 || s3 || snapshot.SupportsModernStandby.Value;
+                snapshot.SupportsHibernate = s4;
+                List<string> states = new List<string>();
+                if (snapshot.SupportsModernStandby.Value) states.Add("S0 低功耗待机（现代待机）");
+                if (s1) states.Add("S1"); if (s2) states.Add("S2"); if (s3) states.Add("S3"); if (s4) states.Add("S4 休眠");
+                snapshot.SleepStates = states.Count == 0 ? "Windows 未报告可用睡眠/休眠状态" : string.Join("、", states);
+                int rtcWake = Marshal.ReadInt32(buffer, 64);
+                if (rtcWake >= 1 && rtcWake <= 6) snapshot.RtcWakeState = rtcWake;
+            }
+            catch (Exception ex) { snapshot.CapabilityError = ReadError(ex); }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        internal static string Win32Error(int code)
+        {
+            string detail = code == 0 ? "Windows 未提供错误码" : new Win32Exception(code).Message;
+            return "Windows 未能读取此项（" + detail + "）。";
+        }
+
+        private static string ReadError(Exception ex)
+        {
+            return ex is DllNotFoundException || ex is EntryPointNotFoundException
+                ? "此 Windows 版本未提供所需的电源查询接口。"
+                : "读取失败（" + ex.GetType().Name + "）。";
+        }
+    }
+
+    internal static class WakeReadinessPolicy
+    {
+        private static string Timer(int? value, bool? visible, string error)
+        {
+            if (visible == false) return "未能确认（此选项在高级电源设置中隐藏）";
+            if (visible != true) return "未能确认" + (string.IsNullOrWhiteSpace(error) ? "" : "（" + error + "）");
+            if (!value.HasValue) return "未能确认";
+            if (value == 0) return "已关闭";
+            if (value == 1) return "已开启";
+            if (value == 2) return "仅重要唤醒（受限）";
+            return "未知设置值（未能确认）";
+        }
+
+        private static string Lid(int? value, bool? present, bool? visible, string error)
+        {
+            if (present == false) return "设备未报告合盖开关（不适用）";
+            if (present != true) return "未能确认" + (string.IsNullOrWhiteSpace(error) ? "" : "：" + error);
+            if (visible == false) return "未能确认（合盖动作选项在高级电源设置中隐藏）";
+            if (visible != true) return "未能确认" + (string.IsNullOrWhiteSpace(error) ? "" : "：" + error);
+            if (!value.HasValue) return "未能确认" + (string.IsNullOrWhiteSpace(error) ? "" : "：" + error);
+            switch (value.Value)
+            {
+                case 0: return "合盖后不操作（电脑保持运行）";
+                case 1: return "合盖后睡眠";
+                case 2: return "合盖后休眠";
+                case 3: return "合盖后关机";
+                default: return "未知设置值（未能确认）";
+            }
+        }
+
+        public static string TaskLogon(string logonType)
+        {
+            if (string.Equals(logonType, "InteractiveToken", StringComparison.OrdinalIgnoreCase)) return "交互登录：锁屏仍登录时可运行；注销/重启后未登录时不能运行";
+            if (string.Equals(logonType, "Password", StringComparison.OrdinalIgnoreCase)) return "密码模式：任务可在用户未登录时运行";
+            if (string.Equals(logonType, "S4U", StringComparison.OrdinalIgnoreCase)) return "S4U 模式：可无交互登录运行，访问网络/加密资源受限";
+            if (string.Equals(logonType, "ServiceAccount", StringComparison.OrdinalIgnoreCase)) return "服务账户模式：以任务中指定的服务账户运行";
+            return "登录模式未能确认";
+        }
+
+        private static bool IsKnownLogonType(string logonType)
+        {
+            return string.Equals(logonType, "InteractiveToken", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(logonType, "Password", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(logonType, "S4U", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(logonType, "ServiceAccount", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string XmlText(XmlNode node, string localName)
+        {
+            XmlNode child = node == null ? null : node.SelectSingleNode("./*[local-name()='" + localName + "']");
+            return child == null ? "" : child.InnerText.Trim();
+        }
+
+        public static WakeTaskInspection InspectTask(WindowsTaskStatus task)
+        {
+            if (task == null) return new WakeTaskInspection { Error = "未能取得任务状态；请重新检查。" };
+            if (!task.Exists)
+                return IsMissingTaskError(task.Error)
+                    ? new WakeTaskInspection { Exists = false, Missing = true }
+                    : new WakeTaskInspection { Error = "Windows 未能确认本程序的计划是否存在；请检查任务计划程序后重试。" };
+            if (!string.IsNullOrWhiteSpace(task.Error) || string.IsNullOrWhiteSpace(task.DefinitionXml))
+                return new WakeTaskInspection { Exists = true, Error = "无法读取计划任务定义；请在任务计划程序核对，随后重新检查。" };
+            try
+            {
+                XmlDocument document = new XmlDocument();
+                document.LoadXml(task.DefinitionXml);
+                XmlNode settings = document.SelectSingleNode("//*[local-name()='Settings']");
+                XmlNode principal = document.SelectSingleNode("//*[local-name()='Principal']");
+                bool parsed;
+                string enabledText = XmlText(settings, "Enabled"), wakeText = XmlText(settings, "WakeToRun");
+                return new WakeTaskInspection
+                {
+                    Exists = true,
+                    Enabled = bool.TryParse(enabledText, out parsed) ? (bool?)parsed : null,
+                    WakeToRun = bool.TryParse(wakeText, out parsed) ? (bool?)parsed : null,
+                    LogonType = XmlText(principal, "LogonType"),
+                    Error = ""
+                };
+            }
+            catch { return new WakeTaskInspection { Exists = true, Error = "无法解析计划任务定义；请重新检查任务计划程序。" }; }
+        }
+
+        private static bool IsMissingTaskError(string error)
+        {
+            if (string.IsNullOrWhiteSpace(error)) return false;
+            return error.IndexOf("cannot find the file", StringComparison.OrdinalIgnoreCase) >= 0
+                || error.IndexOf("does not exist", StringComparison.OrdinalIgnoreCase) >= 0
+                || error.IndexOf("系统找不到指定的文件", StringComparison.OrdinalIgnoreCase) >= 0
+                || error.IndexOf("找不到指定的文件", StringComparison.OrdinalIgnoreCase) >= 0
+                || error.IndexOf("找不到指定的路径", StringComparison.OrdinalIgnoreCase) >= 0
+                || error.IndexOf("指定されたファイルが見つかりません", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        public static WakeReadinessView Evaluate(WakeSystemSnapshot power, WindowsTaskStatus task)
+        {
+            power = power ?? new WakeSystemSnapshot { PowerSource = CurrentPowerSource.Unknown, CheckedAt = DateTimeOffset.Now };
+            WakeTaskInspection taskState = InspectTask(task);
+            string source = power.PowerSource == CurrentPowerSource.PluggedIn ? "插电" : power.PowerSource == CurrentPowerSource.Battery ? "电池" : "供电状态未能确认";
+            int? currentTimer = power.WakeTimerVisible != true ? null
+                : power.PowerSource == CurrentPowerSource.PluggedIn ? power.WakeTimerAc
+                : power.PowerSource == CurrentPowerSource.Battery ? power.WakeTimerDc : null;
+            bool settingsProblem = !IsEnabledTimer(power.WakeTimerAc, power.WakeTimerVisible)
+                || !IsEnabledTimer(power.WakeTimerDc, power.WakeTimerVisible);
+            string lead;
+            if (taskState.Missing)
+                lead = "尚未安装计划；保存并启用后，重新检查本程序唯一计划。";
+            else if (!taskState.Exists.HasValue || !string.IsNullOrWhiteSpace(taskState.Error))
+                lead = "实际计划状态未能确认；请检查 Windows 任务计划程序后重新检查。";
+            else if (taskState.Enabled != true)
+                lead = taskState.Enabled == false ? "计划已暂停；先在本程序中启用计划，再重新检查。" : "计划启用状态未能确认；重新检查任务定义。";
+            else if (taskState.WakeToRun != true)
+                lead = taskState.WakeToRun == false ? "该计划未开启 WakeToRun；请在本程序中更新计划。" : "任务是否允许唤醒未能确认；重新检查任务定义。";
+            else if (power.PowerSource == CurrentPowerSource.Unknown)
+                lead = "当前供电状态未能确认；插电或使用电池后重新检查。";
+            else if (power.WakeTimerVisible == false)
+                lead = source + "唤醒定时器选项在此电源方案中隐藏，当前值未能确认；请按设备和电源模式核对。";
+            else if (!currentTimer.HasValue)
+                lead = source + "唤醒定时器未能确认；打开电源设置检查后重试。";
+            else if (currentTimer.Value == 0)
+                lead = source + "唤醒定时器已关闭；需在电源设置中打开。";
+            else if (currentTimer.Value == 2)
+                lead = source + "只允许重要唤醒；本计划是否被唤醒未能确认。";
+            else if (currentTimer.Value != 1)
+                lead = source + "唤醒定时器值不受识别；请在电源设置中核对。";
+            else if (power.SupportsSleep != true && power.SupportsHibernate != true)
+                lead = "Windows 未确认可用的睡眠/休眠状态；不能据此预期睡眠唤醒。";
+            else if (!IsKnownLogonType(taskState.LogonType))
+                lead = "任务登录模式不受识别；能否在当前 Windows 会话下运行未能确认。";
+            else if (string.Equals(taskState.LogonType, "InteractiveToken", StringComparison.OrdinalIgnoreCase))
+                lead = source + "设置允许尝试；运行时须保持 Windows 已登录（锁屏可以）。";
+            else lead = source + "设置允许尝试计划唤醒；合盖/睡眠唤醒尚未经本机验证。";
+
+            StringBuilder details = new StringBuilder();
+            details.Append("检查时间：").Append(power.CheckedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+            details.Append("\r\n当前供电：").Append(source);
+            details.Append("\r\n当前电源方案：").Append(string.IsNullOrWhiteSpace(power.ActiveSchemeName) ? (power.ActiveSchemeId.HasValue ? power.ActiveSchemeId.Value.ToString("B") : "未能确认") : power.ActiveSchemeName);
+            details.Append("\r\n系统睡眠能力：").Append(power.SleepStates ?? "未能确认");
+            if (!string.IsNullOrWhiteSpace(power.CapabilityError)) details.Append("（").Append(power.CapabilityError).Append("）");
+            details.Append("\r\n硬件 RTC 可唤醒的最深状态：").Append(FormatRtc(power.RtcWakeState, power.SupportsModernStandby));
+            details.Append("\r\n合盖动作：插电 ").Append(Lid(power.LidActionAc, power.LidPresent, power.LidActionVisible, power.LidError));
+            details.Append("；电池 ").Append(Lid(power.LidActionDc, power.LidPresent, power.LidActionVisible, power.LidError));
+            details.Append("\r\n允许唤醒定时器：插电 ").Append(Timer(power.WakeTimerAc, power.WakeTimerVisible, power.WakeTimerVisibilityError));
+            if ((power.WakeTimerVisible != true || !power.WakeTimerAc.HasValue || power.WakeTimerAc.Value != 1) && !string.IsNullOrWhiteSpace(power.WakeTimerAcError)) details.Append("（").Append(power.WakeTimerAcError).Append("）");
+            details.Append("；电池 ").Append(Timer(power.WakeTimerDc, power.WakeTimerVisible, power.WakeTimerVisibilityError));
+            if ((power.WakeTimerVisible != true || !power.WakeTimerDc.HasValue || power.WakeTimerDc.Value != 1) && !string.IsNullOrWhiteSpace(power.WakeTimerDcError)) details.Append("（").Append(power.WakeTimerDcError).Append("）");
+            if (!string.IsNullOrWhiteSpace(power.SchemeError)) details.Append("\r\n电源方案查询：").Append(power.SchemeError);
+            if (!string.IsNullOrWhiteSpace(power.WakeTimerAcError)) details.Append("\r\n插电定时器查询：").Append(power.WakeTimerAcError);
+            if (!string.IsNullOrWhiteSpace(power.WakeTimerDcError)) details.Append("\r\n电池定时器查询：").Append(power.WakeTimerDcError);
+            if (!string.IsNullOrWhiteSpace(power.LidError)) details.Append("\r\n合盖设置查询：").Append(power.LidError);
+            if (!string.IsNullOrWhiteSpace(power.LidVisibilityError)) details.Append("\r\n合盖设置可见性查询：").Append(power.LidVisibilityError);
+            if (!string.IsNullOrWhiteSpace(power.WakeTimerVisibilityError)) details.Append("\r\n唤醒定时器可见性查询：").Append(power.WakeTimerVisibilityError);
+            if (taskState.Missing) details.Append("\r\n本程序的计划任务：不存在；请先保存并启用。");
+            else if (!taskState.Exists.HasValue || !string.IsNullOrWhiteSpace(taskState.Error)) details.Append("\r\n本程序的计划任务：未能确认；").Append(taskState.Error);
+            else
+            {
+                details.Append("\r\n实际计划：").Append(taskState.Enabled.HasValue ? (taskState.Enabled.Value ? "已启用" : "已暂停") : "未能确认是否启用");
+                details.Append("；WakeToRun：").Append(taskState.WakeToRun.HasValue ? (taskState.WakeToRun.Value ? "已开启" : "已关闭") : "未能确认");
+                details.Append("\r\n任务登录：").Append(TaskLogon(taskState.LogonType));
+            }
+            if (!IsEnabledTimer(power.WakeTimerAc, power.WakeTimerVisible) || !IsEnabledTimer(power.WakeTimerDc, power.WakeTimerVisible))
+                details.Append("\r\n下一步：在 Windows“电源选项 → 更改计划设置 → 高级电源设置 → 睡眠 → 允许使用唤醒定时器”检查插电与电池；若此项未显示，请按设备和电源模式核对。");
+            details.Append("\r\n上述检查只反映当前设置；真正的合盖/睡眠唤醒尚未实测。");
+            bool openSettings = settingsProblem || (power.LidPresent == true && (power.LidActionVisible != true || !power.LidActionAc.HasValue || !power.LidActionDc.HasValue))
+                || (power.LidActionAc == 3) || (power.LidActionDc == 3);
+            return new WakeReadinessView { MainSummary = lead, Details = details.ToString(), ShowPowerSettings = openSettings,
+                CheckedAt = power.CheckedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) };
+        }
+
+        private static string FormatRtc(int? state, bool? modernStandby)
+        {
+            if (!state.HasValue) return "未能确认";
+            switch (state.Value)
+            {
+                case 1: return modernStandby == true ? "S0 低功耗待机（现代待机）" : "S0 工作态";
+                case 2: return "S1";
+                case 3: return "S2";
+                case 4: return "S3";
+                case 5: return "S4 休眠";
+                case 6: return "S5 关机（本程序不支持关机启动）";
+            }
+            return "未能确认";
+        }
+
+        private static bool IsEnabledTimer(int? value, bool? visible)
+        {
+            return visible == true && value.HasValue && value.Value == 1;
+        }
+    }
+
+    internal static class WakeReadinessChecks
+    {
+        private static WakeSystemSnapshot Power(CurrentPowerSource source, int? acTimer, int? dcTimer)
+        {
+            return new WakeSystemSnapshot
+            {
+                CheckedAt = new DateTimeOffset(2026, 10, 8, 11, 30, 0, TimeSpan.FromHours(8)),
+                PowerSource = source,
+                WakeTimerVisible = true,
+                ActiveSchemeId = new Guid("381b4222-f694-41f0-9685-ff5bb260df2e"),
+                ActiveSchemeName = "fixture balanced",
+                WakeTimerAc = acTimer,
+                WakeTimerDc = dcTimer,
+                LidPresent = true,
+                LidActionAc = 1,
+                LidActionDc = 1,
+                LidActionVisible = true,
+                SupportsSleep = true,
+                SupportsHibernate = true,
+                SupportsModernStandby = false,
+                SleepStates = "S3 睡眠、S4 休眠",
+                RtcWakeState = 4
+            };
+        }
+
+        private static WindowsTaskStatus Task(string enabled, string wake, string logon)
+        {
+            return new WindowsTaskStatus
+            {
+                Exists = true,
+                DefinitionXml = "<Task><Principals><Principal><LogonType>" + (logon ?? "")
+                    + "</LogonType></Principal></Principals><Settings>"
+                    + (enabled == null ? "" : "<Enabled>" + enabled + "</Enabled>")
+                    + (wake == null ? "" : "<WakeToRun>" + wake + "</WakeToRun>")
+                    + "</Settings></Task>"
+            };
+        }
+
+        internal static WakeSystemSnapshot PowerForLayout()
+        {
+            return Power(CurrentPowerSource.PluggedIn, 1, 0);
+        }
+
+        internal static WindowsTaskStatus TaskForLayout()
+        {
+            WindowsTaskStatus task = Task("true", "true", "InteractiveToken");
+            task.NextRunTime = new DateTime(2026, 10, 8, 12, 0, 0, DateTimeKind.Local);
+            task.LastRunTime = new DateTime(2026, 10, 8, 8, 0, 0, DateTimeKind.Local);
+            return task;
+        }
+
+        public static bool Verify(out string evidence)
+        {
+            List<string> checks = new List<string>();
+            bool ok = true;
+            WakeSystemSnapshot both = Power(CurrentPowerSource.PluggedIn, 1, 0);
+            WindowsTaskStatus interactive = Task("true", "true", "InteractiveToken");
+            WakeReadinessView ac = WakeReadinessPolicy.Evaluate(both, interactive);
+            bool acBatterySplit = ac.MainSummary.Contains("插电设置允许尝试")
+                && ac.Details.Contains("插电 已开启；电池 已关闭")
+                && ac.Details.Contains("允许使用唤醒定时器") && ac.ShowPowerSettings;
+            checks.Add("acBatterySplit=" + acBatterySplit);
+            ok &= acBatterySplit;
+
+            WakeReadinessView battery = WakeReadinessPolicy.Evaluate(Power(CurrentPowerSource.Battery, 1, 0), interactive);
+            bool batteryAction = battery.MainSummary.Contains("电池唤醒定时器已关闭")
+                && battery.Details.Contains("检查插电与电池") && battery.Details.Contains("合盖/睡眠唤醒尚未实测");
+            checks.Add("batteryTimerAction=" + batteryAction);
+            ok &= batteryAction;
+
+            WakeReadinessView disabled = WakeReadinessPolicy.Evaluate(both, Task("false", "true", "InteractiveToken"));
+            WakeReadinessView wakeDisabled = WakeReadinessPolicy.Evaluate(both, Task("true", "false", "InteractiveToken"));
+            bool taskStates = disabled.MainSummary.Contains("计划已暂停") && wakeDisabled.MainSummary.Contains("未开启 WakeToRun");
+            checks.Add("taskEnabledAndWakeToRun=" + taskStates);
+            ok &= taskStates;
+
+            bool interactiveRule = ac.Details.Contains("锁屏仍登录时可运行") && ac.Details.Contains("注销/重启后未登录时不能运行");
+            WakeReadinessView s4u = WakeReadinessPolicy.Evaluate(both, Task("true", "true", "S4U"));
+            bool s4uRule = s4u.Details.Contains("可无交互登录运行") && s4u.Details.Contains("网络/加密资源受限");
+            checks.Add("logonModes=" + (interactiveRule && s4uRule));
+            ok &= interactiveRule && s4uRule;
+
+            WindowsTaskStatus missing = new WindowsTaskStatus { Exists = false, Error = "ERROR: The system cannot find the file specified." };
+            WakeReadinessView missingView = WakeReadinessPolicy.Evaluate(both, missing);
+            WindowsTaskStatus denied = new WindowsTaskStatus { Exists = false, Error = "Access is denied." };
+            WakeReadinessView deniedView = WakeReadinessPolicy.Evaluate(both, denied);
+            bool missingDistinct = missingView.MainSummary.Contains("尚未安装计划")
+                && !missingView.MainSummary.Contains("未能确认") && deniedView.MainSummary.Contains("状态未能确认")
+                && !WakeReadinessPolicy.InspectTask(denied).Missing;
+            checks.Add("missingDistinctFromQueryError=" + missingDistinct);
+            ok &= missingDistinct;
+
+            WakeReadinessView malformed = WakeReadinessPolicy.Evaluate(both, new WindowsTaskStatus { Exists = true, DefinitionXml = "<Task" });
+            WakeReadinessView hiddenWake = WakeReadinessPolicy.Evaluate(both, Task("true", null, "InteractiveToken"));
+            WakeReadinessView unknownLogon = WakeReadinessPolicy.Evaluate(both, Task("true", "true", "UnknownLogon"));
+            WakeSystemSnapshot hiddenTimerPower = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            hiddenTimerPower.WakeTimerVisible = false;
+            WakeReadinessView hiddenTimer = WakeReadinessPolicy.Evaluate(hiddenTimerPower, interactive);
+            bool unknownNotPassing = malformed.MainSummary.Contains("未能确认")
+                && hiddenWake.MainSummary.Contains("任务是否允许唤醒未能确认")
+                && unknownLogon.MainSummary.Contains("任务登录模式不受识别")
+                && hiddenTimer.MainSummary.Contains("唤醒定时器选项在此电源方案中隐藏")
+                && hiddenTimer.Details.Contains("此选项在高级电源设置中隐藏")
+                && !malformed.MainSummary.Contains("允许尝试") && !hiddenWake.MainSummary.Contains("允许尝试")
+                && !unknownLogon.MainSummary.Contains("允许尝试") && !hiddenTimer.MainSummary.Contains("允许尝试");
+            checks.Add("malformedAndHiddenFieldsUnknown=" + unknownNotPassing);
+            ok &= unknownNotPassing;
+
+            WakeSystemSnapshot unsupported = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            unsupported.SupportsSleep = null;
+            unsupported.SupportsHibernate = null;
+            unsupported.SleepStates = "未能确认";
+            unsupported.CapabilityError = "fixture unavailable";
+            WakeReadinessView unsupportedView = WakeReadinessPolicy.Evaluate(unsupported, interactive);
+            bool capabilityUnknown = unsupportedView.MainSummary.Contains("未确认可用")
+                && !unsupportedView.MainSummary.Contains("允许尝试");
+            checks.Add("unsupportedCapabilityUnknown=" + capabilityUnknown);
+            ok &= capabilityUnknown;
+
+            WakeSystemSnapshot modern = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            modern.SupportsModernStandby = true;
+            modern.SupportsSleep = true;
+            modern.SleepStates = "S0 低功耗待机（现代待机）";
+            WakeReadinessView modernView = WakeReadinessPolicy.Evaluate(modern, Task("true", "true", "Password"));
+            bool modernStandby = modernView.Details.Contains("现代待机") && modernView.Details.Contains("密码模式");
+            checks.Add("modernStandbyAndPassword=" + modernStandby);
+            ok &= modernStandby;
+
+            WakeSystemSnapshot unsupportedLid = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            unsupportedLid.LidPresent = false;
+            unsupportedLid.LidActionAc = null;
+            unsupportedLid.LidActionDc = null;
+            WakeReadinessView noLid = WakeReadinessPolicy.Evaluate(unsupportedLid, interactive);
+            WakeSystemSnapshot unknownLid = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            unknownLid.LidActionAc = null;
+            unknownLid.LidActionDc = null;
+            WakeReadinessView hiddenLid = WakeReadinessPolicy.Evaluate(unknownLid, interactive);
+            WakeSystemSnapshot hiddenLidPower = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            hiddenLidPower.LidActionVisible = false;
+            WakeReadinessView hiddenLidValue = WakeReadinessPolicy.Evaluate(hiddenLidPower, interactive);
+            bool lidUnknowns = noLid.Details.Contains("不适用") && hiddenLid.Details.Contains("合盖动作：插电 未能确认")
+                && hiddenLidValue.Details.Contains("合盖动作选项在高级电源设置中隐藏");
+            checks.Add("lidUnsupportedAndHidden=" + lidUnknowns);
+            ok &= lidUnknowns;
+
+            WakeSystemSnapshot restricted = Power(CurrentPowerSource.Battery, 1, 2);
+            WakeReadinessView restrictedView = WakeReadinessPolicy.Evaluate(restricted, interactive);
+            bool restrictedTimer = restrictedView.MainSummary.Contains("只允许重要唤醒") && restrictedView.ShowPowerSettings;
+            checks.Add("restrictedTimer=" + restrictedTimer);
+            ok &= restrictedTimer;
+
+            WakeSystemSnapshot rtc = Power(CurrentPowerSource.PluggedIn, 1, 1);
+            rtc.RtcWakeState = 6;
+            WakeReadinessView rtcView = WakeReadinessPolicy.Evaluate(rtc, interactive);
+            bool rtcDeepestState = !rtcView.MainSummary.Contains("未能确认")
+                && rtcView.Details.Contains("S5 关机（本程序不支持关机启动）");
+            checks.Add("rtcDeepestState=" + rtcDeepestState);
+            ok &= rtcDeepestState;
+
+            evidence = string.Join("; ", checks);
+            return ok;
         }
     }
 
@@ -5546,6 +6132,17 @@ namespace CodexQuotaWaker
                 lines.Add("TimelineContinuity=" + timelineContinuityOk);
                 success = success && timelineContinuityOk;
 
+                string wakeReadinessEvidence;
+                bool wakeReadinessOk = WakeReadinessChecks.Verify(out wakeReadinessEvidence);
+                lines.Add("WakeReadinessEvidence=" + wakeReadinessEvidence);
+                lines.Add("WakeReadiness=" + wakeReadinessOk);
+                success = success && wakeReadinessOk;
+                string wakeReadinessLayoutEvidence;
+                bool wakeReadinessLayoutOk = MainForm.VerifyWakeReadinessLayout(out wakeReadinessLayoutEvidence);
+                lines.Add("WakeReadinessLayoutEvidence=" + wakeReadinessLayoutEvidence);
+                lines.Add("WakeReadinessLayout=" + wakeReadinessLayoutOk);
+                success = success && wakeReadinessLayoutOk;
+
                 bool budgetOk = ExecutionBudget.TotalSeconds(3) == 870
                     && ExecutionBudget.TaskExecutionLimitMinutes(3) == 16;
                 lines.Add("ExecutionBudget=" + budgetOk);
@@ -5817,6 +6414,10 @@ namespace CodexQuotaWaker
         private readonly Label nextRunDateLabel;
         private readonly Label heroHintLabel;
         private readonly Label installedSummaryLabel;
+        private readonly Label wakeReadinessLabel;
+        private readonly FlowLayoutPanel wakeReadinessActions;
+        private readonly Button wakeRefreshButton;
+        private readonly Button openPowerSettingsButton;
         private readonly Button installedDetailsButton;
         private readonly Button routeDetailsButton;
         private readonly FlowLayoutPanel advancedBody;
@@ -5824,6 +6425,8 @@ namespace CodexQuotaWaker
         private readonly Panel advancedCard;
         private readonly Panel routeCard;
         private readonly Panel installedCard;
+        private readonly Panel installedBody;
+        private readonly FlowLayoutPanel installedContent;
         private DateTime? installedNextRunTime;
         private bool installedTaskExists;
         private bool installedTaskEnabled;
@@ -6161,17 +6764,40 @@ namespace CodexQuotaWaker
             dataSplit.Resize += delegate { UpdateResultPanelMinimum(); };
             rightStack.Controls.Add(dataSplit);
 
-            Panel installedBody;
-            installedCard = NewCard("Windows 计划状态", out installedBody, 230);
+            installedCard = NewCard("Windows 计划状态 · 唤醒条件", out installedBody, 260);
             installedBody.AutoScroll = true;
-            installedSummaryLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
-            planDetailLabel = new Label { Dock = DockStyle.Top, AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Visible = false, Margin = new Padding(0, 5, 0, 4) };
-            installedDetailsButton = NewButton("查看计划信息", false);
-            installedDetailsButton.Dock = DockStyle.Bottom;
+            installedContent = NewFlow(false);
+            installedContent.FlowDirection = FlowDirection.TopDown;
+            installedContent.WrapContents = false;
+            installedContent.AutoSize = true;
+            installedContent.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            installedContent.Dock = DockStyle.Top;
+            installedContent.Margin = Padding.Empty;
+            installedContent.Padding = Padding.Empty;
+            installedSummaryLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 10F), Margin = new Padding(0, 0, 0, 8) };
+            wakeReadinessLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 9.5F), Margin = new Padding(0, 5, 0, 6) };
+            wakeReadinessActions = NewFlow(false);
+            wakeReadinessActions.WrapContents = true;
+            wakeReadinessActions.AutoSize = true;
+            wakeReadinessActions.Margin = Padding.Empty;
+            wakeRefreshButton = NewButton("重新检查唤醒条件", false);
+            wakeRefreshButton.Click += delegate { RefreshWakeReadiness(); };
+            openPowerSettingsButton = NewButton("打开电源设置", false);
+            openPowerSettingsButton.Visible = false;
+            openPowerSettingsButton.Click += delegate { OpenPowerSettings(); };
+            wakeReadinessActions.Controls.Add(wakeRefreshButton);
+            wakeReadinessActions.Controls.Add(openPowerSettingsButton);
+            planDetailLabel = new Label { AutoSize = true, MaximumSize = new Size(620, 0), ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 9F), Visible = false, Margin = new Padding(0, 5, 0, 4) };
+            installedDetailsButton = NewButton("查看计划与唤醒详情", false);
+            installedDetailsButton.Margin = new Padding(0, 8, 0, 6);
             installedDetailsButton.Click += delegate { ToggleInstalledDetails(); };
-            installedBody.Controls.Add(planDetailLabel);
-            installedBody.Controls.Add(installedSummaryLabel);
-            installedBody.Controls.Add(installedDetailsButton);
+            installedContent.Controls.Add(installedSummaryLabel);
+            installedContent.Controls.Add(wakeReadinessLabel);
+            installedContent.Controls.Add(wakeReadinessActions);
+            installedContent.Controls.Add(installedDetailsButton);
+            installedContent.Controls.Add(planDetailLabel);
+            installedBody.Controls.Add(installedContent);
+            installedBody.ClientSizeChanged += delegate { FitInstalledContent(); };
             rightStack.Controls.Add(installedCard);
             mainGrid.Controls.Add(rightStack, 1, 0);
             pageRoot.Controls.Add(mainGrid, 0, 2);
@@ -6271,8 +6897,10 @@ namespace CodexQuotaWaker
             routeDetailLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
             modelCatalogFeedbackLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
             resultSummaryLabel.MaximumSize = new Size(Math.Max(120, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
-            installedSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
-            planDetailLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64), 0);
+            installedSummaryLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
+            wakeReadinessLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
+            FitInstalledContent();
+            planDetailLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
             sequenceSummaryLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
 
             int leftHeight = leftStack.Height + leftStack.Margin.Vertical;
@@ -6314,6 +6942,22 @@ namespace CodexQuotaWaker
                 scale = heroCard.Height / 172F;
             }
             return Math.Max(1, (int)Math.Round(logicalHeight * scale));
+        }
+
+        private void FitInstalledContent()
+        {
+            if (wakeReadinessActions == null || installedContent == null || installedBody == null || installedBody.ClientSize.Width <= 0) return;
+            int width = Math.Max(180, installedBody.ClientSize.Width);
+            if (installedContent.MaximumSize.Width != width || installedContent.Width != width)
+            {
+                installedContent.MaximumSize = new Size(width, 0);
+                installedContent.Width = width;
+            }
+            installedSummaryLabel.MaximumSize = new Size(width, 0);
+            wakeReadinessLabel.MaximumSize = new Size(width, 0);
+            planDetailLabel.MaximumSize = new Size(width, 0);
+            if (wakeReadinessActions.MaximumSize.Width != width)
+                wakeReadinessActions.MaximumSize = new Size(width, 0);
         }
 
         private static int StackHeight(FlowLayoutPanel stack)
@@ -6636,8 +7280,8 @@ namespace CodexQuotaWaker
         {
             installedDetailsExpanded = !installedDetailsExpanded;
             planDetailLabel.Visible = installedDetailsExpanded;
-            installedDetailsButton.Text = installedDetailsExpanded ? "收起计划信息" : "查看计划信息";
-            installedCard.Height = ScaleLayoutHeight(installedDetailsExpanded ? 300 : 230);
+            installedDetailsButton.Text = installedDetailsExpanded ? "收起计划与唤醒详情" : "查看计划与唤醒详情";
+            installedCard.Height = ScaleLayoutHeight(installedDetailsExpanded ? 360 : 260);
             LayoutResponsive();
         }
 
@@ -7073,6 +7717,87 @@ namespace CodexQuotaWaker
                         + ",split=" + form.resultsSplit.Height + "/" + form.resultsSplit.SplitterDistance + "/" + form.resultsSplit.Panel2MinSize);
                     ok &= readable && detail;
                 }
+            }
+            evidence = string.Join("; ", checks);
+            return ok;
+        }
+
+        internal static bool VerifyWakeReadinessLayout(out string evidence)
+        {
+            bool ok = true;
+            List<string> checks = new List<string>();
+            foreach (int width in new[] { 1420, 760 })
+            foreach (float scale in new[] { 1F, 1.5F })
+            using (MainForm form = new MainForm())
+            {
+                form.StartPosition = FormStartPosition.Manual;
+                form.ShowInTaskbar = false;
+                if (Math.Abs(scale - 1F) > 0.001F)
+                {
+                    form.Scale(new SizeF(scale, scale));
+                    form.Font = new Font("Microsoft YaHei UI", 9F * scale);
+                }
+                form.ClientSize = new Size(width, 620);
+                IntPtr handle = form.Handle;
+                EnsureControlHandles(form);
+                form.config = new AppConfig { SequenceCount = 1, SequenceStart = DateTime.Now.AddHours(2).ToString("yyyy-MM-dd HH:mm") };
+                form.LayoutResponsive();
+                WakeSystemSnapshot power = WakeReadinessChecks.PowerForLayout();
+                WindowsTaskStatus task = WakeReadinessChecks.TaskForLayout();
+                WakeReadinessView view = WakeReadinessPolicy.Evaluate(power, task);
+                form.installedSummaryLabel.Text = BuildInstalledTaskSummary(task, WakeReadinessPolicy.InspectTask(task));
+                form.UpdateWakeReadiness(power, task);
+                PerformLayoutTree(form);
+
+                Panel body = form.installedBody;
+                Size leadPreferred = form.wakeReadinessLabel.GetPreferredSize(new Size(form.wakeReadinessLabel.MaximumSize.Width, 0));
+                Rectangle summary = BoundsInAncestor(form.installedSummaryLabel, body);
+                Rectangle lead = BoundsInAncestor(form.wakeReadinessLabel, body);
+                Rectangle actions = BoundsInAncestor(form.wakeReadinessActions, body);
+                Rectangle detailToggle = BoundsInAncestor(form.installedDetailsButton, body);
+                bool collapsedReadable = body.AutoScroll && view.ShowPowerSettings
+                    && form.wakeReadinessActions.Controls.Contains(form.openPowerSettingsButton)
+                    && form.wakeRefreshButton.Enabled && form.wakeReadinessLabel.Height >= leadPreferred.Height
+                    && lead.Width <= body.ClientSize.Width && actions.Width <= body.ClientSize.Width && !summary.IntersectsWith(lead)
+                    && !lead.IntersectsWith(actions) && form.installedDetailsButton.Parent == form.installedContent;
+
+                form.installedDetailsExpanded = true;
+                form.planDetailLabel.Visible = true;
+                form.installedDetailsButton.Text = "收起计划与唤醒详情";
+                form.installedCard.Height = form.ScaleLayoutHeight(360);
+                form.SetPlanDetails(task, null, view);
+                form.LayoutResponsive();
+                PerformLayoutTree(form);
+                Size detailPreferred = form.planDetailLabel.GetPreferredSize(new Size(form.planDetailLabel.MaximumSize.Width, 0));
+                Rectangle details = BoundsInAncestor(form.planDetailLabel, body);
+                Rectangle expandedActions = BoundsInAncestor(form.wakeReadinessActions, body);
+                Rectangle expandedToggle = BoundsInAncestor(form.installedDetailsButton, body);
+                bool expandedReadable = form.planDetailLabel.Height >= detailPreferred.Height
+                    && form.planDetailLabel.Width <= body.ClientSize.Width
+                    && expandedActions.Width <= body.ClientSize.Width
+                    && !summary.IntersectsWith(lead) && !details.IntersectsWith(expandedActions)
+                    && !details.IntersectsWith(expandedToggle)
+                    && body.ClientRectangle.IntersectsWith(expandedToggle);
+                body.ScrollControlIntoView(form.planDetailLabel);
+                PerformLayoutTree(form);
+                Rectangle scrolledDetails = BoundsInAncestor(form.planDetailLabel, body);
+                expandedReadable &= body.ClientRectangle.IntersectsWith(scrolledDetails);
+                body.AutoScrollPosition = Point.Empty;
+                body.ScrollControlIntoView(form.wakeRefreshButton);
+                PerformLayoutTree(form);
+                Rectangle scrolledRefresh = BoundsInAncestor(form.wakeRefreshButton, body);
+                bool refreshReachable = body.ClientRectangle.IntersectsWith(scrolledRefresh);
+                checks.Add(width + "/" + scale + ":collapsed=" + collapsedReadable + "[auto=" + body.AutoScroll
+                    + ",settingsExpected=" + view.ShowPowerSettings + ",refresh=" + form.wakeRefreshButton.Enabled
+                    + ",lead=" + form.wakeReadinessLabel.Height + "/" + leadPreferred.Height
+                    + ",width=" + lead.Width + "/" + body.ClientSize.Width
+                    + ",actionWidth=" + actions.Width + "/" + body.ClientSize.Width
+                    + ",summaryOverlap=" + summary.IntersectsWith(lead) + ",actionOverlap=" + lead.IntersectsWith(actions)
+                    + ",toggleAttached=" + (form.installedDetailsButton.Parent == form.installedContent) + "] ,expanded=" + expandedReadable
+                    + ",refreshReachable=" + refreshReachable + ",body=" + FormatBounds(body.ClientRectangle)
+                    + ",lead=" + FormatBounds(lead) + ",actions=" + FormatBounds(expandedActions)
+                    + ",details=" + FormatBounds(details) + ",toggle=" + FormatBounds(detailToggle));
+                ok &= collapsedReadable && expandedReadable && refreshReachable;
             }
             evidence = string.Join("; ", checks);
             return ok;
@@ -7657,53 +8382,149 @@ namespace CodexQuotaWaker
             WindowsTaskStatus taskStatus = WindowsTaskService.GetStatus();
             DateTime now = DateTime.Now;
             RunRecord last = JsonStore.LoadLastRun();
-            installedTaskExists = taskStatus.Exists;
             timelineSavedUtc = File.GetLastWriteTimeUtc(AppPaths.ConfigPath);
             timelineHistory = TimelineExecutionPolicy.InstalledMatches(config ?? new AppConfig(), taskStatus)
                 ? TimelineHistoryStore.ReadForTimeline(config, taskStatus, last) : new List<TimelineExecution>();
-            installedTaskEnabled = taskStatus.Exists && taskStatus.Enabled;
-            installedNextRunTime = taskStatus.NextRunTime;
-
-            if (taskStatus.Exists && taskStatus.Enabled)
-            {
-                statusLabel.Text = "●  Windows 计划已启用";
-                statusLabel.ForeColor = taskStatus.WakeToRun ? Color.FromArgb(51, 149, 119) : Color.FromArgb(174, 119, 35);
-                statusLabel.BackColor = taskStatus.WakeToRun ? Color.FromArgb(237, 248, 242) : Color.FromArgb(250, 244, 230);
-            }
-            else if (taskStatus.Exists)
-            {
-                statusLabel.Text = "●  Windows 计划已暂停";
-                statusLabel.ForeColor = Color.FromArgb(174, 119, 35);
-                statusLabel.BackColor = Color.FromArgb(250, 244, 230);
-            }
-            else
-            {
-                statusLabel.Text = "●  尚未安装计划";
-                statusLabel.ForeColor = Muted;
-                statusLabel.BackColor = Color.FromArgb(239, 236, 245);
-            }
-
-            installedSummaryLabel.Text = taskStatus.Exists
-                ? (taskStatus.Enabled ? "计划已存在 · 已启用" : "计划已存在 · 已暂停")
-                    + "\r\n" + (taskStatus.WakeToRun ? "允许唤醒电脑" : "未确认允许唤醒")
-                    + " · " + (taskStatus.CanRunWithoutLogon ? "无需登录" : "需要登录 Windows")
-                    + "\r\nWindows 下次运行：" + FormatTaskTime(taskStatus.NextRunTime)
-                    + "\r\nWindows 上次运行：" + FormatTaskTime(taskStatus.LastRunTime)
-                : "Windows 中尚无本程序的计划任务。保存后只会管理一条 " + TaskXml.TaskName + "。";
-            planDetailLabel.Text = taskStatus.Exists
-                ? DescribeInstalledPlan(taskStatus.NextRunTime, taskStatus, last)
-                    + (string.IsNullOrWhiteSpace(taskStatus.RuntimeDetailsError) ? string.Empty : "\r\n" + taskStatus.RuntimeDetailsError)
-                : "任务名：" + TaskXml.TaskName + "\r\n" + (string.IsNullOrWhiteSpace(taskStatus.Error)
-                    ? "修改后点击“保存并启用计划”会安装此计划。"
-                    : taskStatus.Error + "\r\n请检查 Windows 任务计划程序权限后重试。");
-            installedDetailsButton.Enabled = true;
-            saveButton.Text = taskStatus.Exists ? "更新并启用计划  ↗" : "保存并启用计划  ↗";
+            UpdateInstalledTaskPresentation(taskStatus);
+            SetPlanDetails(taskStatus, last, null);
+            UpdateWakeReadiness(WakeSystemReader.Read(), taskStatus);
             if (hasUnsavedChanges) UpdateDraftTimeline(now);
             else UpdateTimeline(now);
             bool successUnavailable;
             SuccessSnapshot recentSuccess = RecentSuccessStore.LoadForApplication(last, out successUnavailable);
             SetRecentResultSummary(recentSuccess, successUnavailable, last, last == null && File.Exists(AppPaths.LastRunPath));
             SetLatestAttemptDetails(last);
+        }
+
+        private void UpdateInstalledTaskPresentation(WindowsTaskStatus taskStatus)
+        {
+            WakeTaskInspection inspection = WakeReadinessPolicy.InspectTask(taskStatus);
+            installedTaskExists = inspection.Exists == true;
+            installedTaskEnabled = inspection.Enabled == true;
+            installedNextRunTime = inspection.Exists == true ? taskStatus.NextRunTime : null;
+            if (inspection.Exists == true && inspection.Enabled == true)
+            {
+                statusLabel.Text = "●  Windows 计划已启用";
+                statusLabel.ForeColor = inspection.WakeToRun == true ? Color.FromArgb(51, 149, 119) : Color.FromArgb(174, 119, 35);
+                statusLabel.BackColor = inspection.WakeToRun == true ? Color.FromArgb(237, 248, 242) : Color.FromArgb(250, 244, 230);
+            }
+            else if (inspection.Exists == true && inspection.Enabled == false)
+            {
+                statusLabel.Text = "●  Windows 计划已暂停";
+                statusLabel.ForeColor = Color.FromArgb(174, 119, 35);
+                statusLabel.BackColor = Color.FromArgb(250, 244, 230);
+            }
+            else if (inspection.Missing)
+            {
+                statusLabel.Text = "●  尚未安装计划";
+                statusLabel.ForeColor = Muted;
+                statusLabel.BackColor = Color.FromArgb(239, 236, 245);
+            }
+            else
+            {
+                statusLabel.Text = "●  Windows 计划状态未能确认";
+                statusLabel.ForeColor = Muted;
+                statusLabel.BackColor = Color.FromArgb(239, 236, 245);
+            }
+            installedSummaryLabel.Text = BuildInstalledTaskSummary(taskStatus, inspection);
+            installedDetailsButton.Enabled = true;
+            saveButton.Text = inspection.Exists == true ? "更新并启用计划  ↗" : "保存并启用计划  ↗";
+        }
+
+        private void SetPlanDetails(WindowsTaskStatus taskStatus, RunRecord last, WakeReadinessView wake)
+        {
+            string plan = taskStatus.Exists
+                ? DescribeInstalledPlan(taskStatus.NextRunTime, taskStatus, last)
+                    + (string.IsNullOrWhiteSpace(taskStatus.RuntimeDetailsError) ? string.Empty : "\r\n" + taskStatus.RuntimeDetailsError)
+                : "任务名：" + TaskXml.TaskName + "\r\n" + (string.IsNullOrWhiteSpace(taskStatus.Error)
+                    ? "修改后点击“保存并启用计划”会安装此计划。"
+                    : taskStatus.Error + "\r\n请检查 Windows 任务计划程序权限后重试。");
+            planDetailLabel.Text = plan + "\r\n\r\n唤醒条件详情\r\n"
+                + (wake == null ? "请重新检查以读取当前系统状态。" : wake.Details);
+        }
+
+        private static string BuildInstalledTaskSummary(WindowsTaskStatus taskStatus, WakeTaskInspection inspection)
+        {
+            if (inspection.Missing)
+                return "Windows 中尚无本程序的计划任务。保存后只会管理一条 " + TaskXml.TaskName + "。";
+            if (inspection.Exists != true)
+                return "Windows 计划状态未能确认；请重新检查任务计划程序后再保存。\r\n"
+                    + (string.IsNullOrWhiteSpace(inspection.Error) ? "" : inspection.Error);
+
+            string summary = "计划已存在 · " + (inspection.Enabled.HasValue
+                ? (inspection.Enabled.Value ? "已启用" : "已暂停") : "启用状态未能确认")
+                + "\r\n" + (inspection.WakeToRun.HasValue
+                    ? (inspection.WakeToRun.Value ? "允许唤醒电脑" : "未开启 WakeToRun") : "WakeToRun 状态未能确认")
+                + " · " + WakeReadinessPolicy.TaskLogon(inspection.LogonType)
+                + "\r\nWindows 下次运行：" + FormatTaskTime(taskStatus.NextRunTime)
+                + "\r\nWindows 上次运行：" + FormatTaskTime(taskStatus.LastRunTime);
+            if (!string.IsNullOrWhiteSpace(inspection.Error)) summary += "\r\n" + inspection.Error;
+            return summary;
+        }
+
+        private void UpdateWakeReadiness(WakeSystemSnapshot power, WindowsTaskStatus taskStatus)
+        {
+            WakeReadinessView view = WakeReadinessPolicy.Evaluate(power, taskStatus);
+            wakeReadinessLabel.Text = "唤醒条件：" + view.MainSummary + "\r\n检查时间：" + view.CheckedAt;
+            openPowerSettingsButton.Visible = view.ShowPowerSettings;
+            wakeRefreshButton.Enabled = true;
+            if (installedDetailsExpanded) SetPlanDetails(taskStatus, JsonStore.LoadLastRun(), view);
+        }
+
+        private void RefreshWakeReadiness()
+        {
+            if (!wakeRefreshButton.Enabled) return;
+            wakeRefreshButton.Enabled = false;
+            wakeReadinessLabel.Text = "正在读取 Windows 当前供电、电源方案和计划状态…";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                WindowsTaskStatus taskStatus = null;
+                WakeSystemSnapshot power = null;
+                string error = "";
+                try
+                {
+                    taskStatus = WindowsTaskService.GetStatus();
+                    power = WakeSystemReader.Read();
+                }
+                catch { error = "Windows 唤醒条件暂不可确认；请重试或在任务计划程序核对。"; }
+
+                if (IsDisposed || !IsHandleCreated) return;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (IsDisposed) return;
+                        if (!string.IsNullOrWhiteSpace(error))
+                        {
+                            wakeReadinessLabel.Text = error;
+                            openPowerSettingsButton.Visible = true;
+                        }
+                        else
+                        {
+                            UpdateInstalledTaskPresentation(taskStatus);
+                            UpdateWakeReadiness(power, taskStatus);
+                            if (hasUnsavedChanges) UpdateDraftTimeline(DateTime.Now);
+                            else UpdateTimeline(DateTime.Now);
+                        }
+                        wakeRefreshButton.Enabled = true;
+                        LayoutResponsive();
+                    });
+                }
+                catch { }
+            });
+        }
+
+        private void OpenPowerSettings()
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo("control.exe", "/name Microsoft.PowerOptions") { UseShellExecute = true });
+            }
+            catch
+            {
+                MessageBox.Show("无法打开电源设置。请在 Windows 设置中搜索“电源和睡眠”，或从控制面板打开“电源选项”。", Text,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
 
         private void SetLatestAttemptDetails(RunRecord last)
@@ -7803,10 +8624,12 @@ namespace CodexQuotaWaker
 
         private string DescribeInstalledPlan(DateTime? next, WindowsTaskStatus taskStatus, RunRecord last)
         {
+            WakeTaskInspection inspection = WakeReadinessPolicy.InspectTask(taskStatus);
             StringBuilder detail = new StringBuilder();
             detail.Append("任务名：").Append(TaskXml.TaskName).Append("（唯一一条）");
-            detail.Append("\r\n任务计划程序实际状态：").Append(taskStatus.Enabled ? "已启用" : "已暂停");
-            detail.Append("；允许唤醒：").Append(taskStatus.WakeToRun ? "是" : "否");
+            detail.Append("\r\n任务计划程序实际状态：").Append(inspection.Enabled.HasValue ? (inspection.Enabled.Value ? "已启用" : "已暂停") : "未能确认");
+            detail.Append("；允许唤醒：").Append(inspection.WakeToRun.HasValue ? (inspection.WakeToRun.Value ? "是" : "否") : "未能确认");
+            detail.Append("；登录：").Append(WakeReadinessPolicy.TaskLogon(inspection.LogonType));
             detail.Append("；Windows 下次运行：").Append(FormatTaskTime(taskStatus.NextRunTime));
             detail.Append("；Windows 上次运行：").Append(FormatTaskTime(taskStatus.LastRunTime));
             detail.Append("\r\n计划：");
