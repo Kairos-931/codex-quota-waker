@@ -76,6 +76,22 @@ try {
     }
 
     Write-Output 'TaskRegistration=PASS'
+
+    Unregister-ScheduledTask -TaskName $testTaskName -Confirm:$false
+    $pausedExport = Start-Process -FilePath $exePath -ArgumentList @('--export-paused-task-xml', $taskXmlPath) -Wait -PassThru -WindowStyle Hidden
+    if ($pausedExport.ExitCode -ne 0) { throw '暂停计划 XML 导出失败。' }
+    [xml]$pausedXml = Get-Content -LiteralPath $taskXmlPath -Raw
+    $expectedTimes = @($pausedXml.SelectNodes("//*[local-name()='TimeTrigger']/*[local-name()='StartBoundary']") | ForEach-Object { [DateTime]::Parse($_.InnerText).ToString('s') })
+    schtasks.exe /Create /TN $testTaskName /XML $taskXmlPath /F | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Windows 拒绝注册暂停计划验证任务。' }
+    $pausedTask = Get-ScheduledTask -TaskName $testTaskName -ErrorAction Stop
+    $actualTimes = @($pausedTask.Triggers | ForEach-Object { [DateTime]::Parse($_.StartBoundary).ToString('s') })
+    if ($actualTimes.Count -ne 48 -or ($actualTimes -join '|') -ne ($expectedTimes -join '|')) { throw 'Windows 暂停计划触发时间与预览定义不一致。' }
+    if (@($pausedTask.Triggers | Where-Object { $_.Repetition.Interval }).Count -ne 0) { throw '暂停模式错误使用了固定重复触发器。' }
+    if (-not $pausedTask.Settings.WakeToRun -or $pausedTask.Actions.Execute -ne $exePath) { throw '暂停模式任务属性或 EXE 不一致。' }
+    $expectedArguments = $pausedXml.SelectSingleNode("//*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Arguments']").InnerText
+    if ($pausedTask.Actions.Arguments -ne $expectedArguments) { throw '暂停模式计划版本参数不一致。' }
+    Write-Output 'PausedTaskRegistration=PASS;Triggers=48;PreviewTimesMatch=True;PlanVersionMatch=True'
 }
 finally {
     if (Get-ScheduledTask -TaskName $testTaskName -ErrorAction SilentlyContinue) {

@@ -25,9 +25,9 @@ using System.Xml;
 [assembly: AssemblyTitle("Codex Quota Waker")]
 [assembly: AssemblyProduct("Codex Quota Waker")]
 [assembly: AssemblyDescription("Wake Windows and run a verifiable local Codex request on schedule.")]
-[assembly: AssemblyVersion("0.19.0.0")]
-[assembly: AssemblyFileVersion("0.19.0.0")]
-[assembly: AssemblyInformationalVersion("0.19.0")]
+[assembly: AssemblyVersion("0.20.0.0")]
+[assembly: AssemblyFileVersion("0.20.0.0")]
+[assembly: AssemblyInformationalVersion("0.20.0")]
 
 namespace CodexQuotaWaker
 {
@@ -72,6 +72,15 @@ namespace CodexQuotaWaker
                     return 0;
                 }
 
+                if (args.Length > 1 && args[0] == "--export-paused-task-xml")
+                {
+                    AppConfig fixture = DailyPauseChecks.Fixture(DateTime.Today.AddDays(4), 46);
+                    fixture.ExtraWakeTimes.Add(DateTime.Today.AddDays(4).AddHours(3).ToString("yyyy-MM-dd HH:mm"));
+                    fixture.ExtraWakeTimes.Add(DateTime.Today.AddDays(4).AddHours(5).ToString("yyyy-MM-dd HH:mm"));
+                    File.WriteAllText(args[1], TaskXml.Build(fixture, Assembly.GetExecutingAssembly().Location,
+                        WindowsIdentity.GetCurrent().User.Value), Encoding.Unicode);
+                    return 0;
+                }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new MainForm());
@@ -182,6 +191,9 @@ namespace CodexQuotaWaker
         public string SequenceStart { get; set; }
         public int SequenceCount { get; set; }
         public int SequenceIntervalMinutes { get; set; }
+        public bool DailyPauseEnabled { get; set; }
+        public string DailyPauseStart { get; set; }
+        public string DailyPauseEnd { get; set; }
         public List<string> ExtraWakeTimes { get; set; }
         public bool SleepAfterScheduledWake { get; set; }
         public bool RunWithoutLogon { get; set; }
@@ -200,6 +212,8 @@ namespace CodexQuotaWaker
             SequenceStart = string.Empty;
             SequenceCount = 0;
             SequenceIntervalMinutes = 310;
+            DailyPauseStart = "03:00";
+            DailyPauseEnd = "05:00";
             ExtraWakeTimes = new List<string>();
             SleepAfterScheduledWake = false;
             RunWithoutLogon = false;
@@ -838,6 +852,108 @@ namespace CodexQuotaWaker
         }
     }
 
+    internal static class DailyPauseSchedule
+    {
+        public const int MaximumTriggers = 48;
+        public static bool IsActive(AppConfig config) { return config != null && config.DailyPauseEnabled && config.SequenceCount > 0; }
+        public static string Describe(AppConfig config) { return config.DailyPauseStart + "–" + config.DailyPauseEnd; }
+
+        private static bool TryMinute(string text, out int minute)
+        {
+            DateTime parsed;
+            bool ok = DateTime.TryParseExact(text, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed);
+            minute = ok ? parsed.Hour * 60 + parsed.Minute : 0;
+            return ok;
+        }
+
+        internal static bool Contains(DateTime value, int start, int end)
+        {
+            double minute = value.TimeOfDay.TotalMinutes;
+            return start < end ? minute >= start && minute < end : minute >= start || minute < end;
+        }
+
+        internal static DateTime Resume(DateTime value, int start, int end)
+        {
+            DateTime resume = value.Date.AddMinutes(end);
+            return start > end && value.TimeOfDay.TotalMinutes >= start ? resume.AddDays(1) : resume;
+        }
+
+        // Calendar arithmetic is intentional: the plan counts local wall-clock minutes.
+        internal static DateTime Advance(DateTime value, int minutes, int start, int end)
+        {
+            long remaining = minutes;
+            DateTime cursor = value;
+            while (remaining > 0)
+            {
+                if (Contains(cursor, start, end)) cursor = Resume(cursor, start, end);
+                DateTime boundary = cursor.Date.AddMinutes(start);
+                if (boundary <= cursor) boundary = boundary.AddDays(1);
+                long available = (boundary.Ticks - cursor.Ticks) / TimeSpan.TicksPerMinute;
+                if (remaining < available) return cursor.AddMinutes(remaining);
+                remaining -= available;
+                cursor = Resume(boundary, start, end);
+            }
+            // Finishing exactly at the left boundary resumes at the excluded period's end.
+            return cursor;
+        }
+
+        public static bool TrySequence(AppConfig config, out List<DateTime> times, out string error)
+        {
+            times = new List<DateTime>(); error = "";
+            if (!IsActive(config)) return true;
+            int start = 0, end = 0;
+            if (!TryMinute(config.DailyPauseStart, out start) || !TryMinute(config.DailyPauseEnd, out end))
+                error = "每天暂停计时的起止时间必须为 HH:mm。";
+            else if (start == end) error = "暂停起止时间不能相同（不能全天暂停）。请调整时段。";
+            else if (config.SequenceCount > MaximumTriggers)
+                error = "开启暂停计时时最多支持 48 个去重触发时间；当前序列已有 " + config.SequenceCount + " 次。请减少次数或关闭暂停计时。";
+            DateTime first;
+            if (!AppConfig.TryParseSequenceStart(config.SequenceStart, out first))
+                error = "请设置有效的首次执行日期和时间。";
+            if (error.Length > 0) return false;
+            try
+            {
+                if (Contains(first, start, end))
+                {
+                    error = "首次时间落在每天暂停计时 " + Describe(config) + " 内；最早可用时间为 "
+                        + Resume(first, start, end).ToString("yyyy-MM-dd HH:mm") + "。请调整首次时间后保存。";
+                    return false;
+                }
+                DateTime cursor = DateTime.SpecifyKind(first, DateTimeKind.Unspecified);
+                times.Add(cursor);
+                for (int i = 1; i < config.SequenceCount; i++)
+                {
+                    cursor = Advance(cursor, SequenceSchedule.GetIntervalMinutes(config), start, end);
+                    times.Add(cursor);
+                }
+                return true;
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                times.Clear(); error = "暂停后的执行日期超出了 Windows 可表示范围。请减少次数或间隔。";
+                return false;
+            }
+        }
+
+        public static string Validate(AppConfig config) { return Validate(config, TimeZoneInfo.Local); }
+        internal static string Validate(AppConfig config, TimeZoneInfo zone)
+        {
+            if (!IsActive(config)) return "";
+            List<DateTime> times; string error;
+            if (!TrySequence(config, out times, out error)) return error;
+            List<PlannedRun> merged = SchedulePlanner.Build(config, DateTime.MinValue, 1);
+            if (merged.Count > MaximumTriggers)
+                return "开启暂停计时时最多支持 48 个去重触发时间；当前共 " + merged.Count + " 个。请减少序列次数或额外时间；原计划将保留。";
+            foreach (PlannedRun run in merged)
+            {
+                DateTime local = DateTime.SpecifyKind(run.Time, DateTimeKind.Unspecified);
+                if (zone.IsInvalidTime(local) || zone.IsAmbiguousTime(local))
+                    return "计划时间 " + local.ToString("yyyy-MM-dd HH:mm") + " 在本地夏令时中不存在或有歧义。请调整受影响的日期/时间后保存。";
+            }
+            return "";
+        }
+    }
+
     internal static class SequenceSchedule
     {
         public const int DefaultIntervalMinutes = 310;
@@ -851,6 +967,12 @@ namespace CodexQuotaWaker
 
         public static DateTime? NextRun(AppConfig config, DateTime now)
         {
+            if (DailyPauseSchedule.IsActive(config))
+            {
+                List<DateTime> times; string error;
+                if (!DailyPauseSchedule.TrySequence(config, out times, out error)) return null;
+                return times.Where(t => t > now).Select(t => (DateTime?)t).FirstOrDefault();
+            }
             DateTime start;
             if (config == null
                 || config.SequenceCount <= 0
@@ -882,6 +1004,11 @@ namespace CodexQuotaWaker
 
         public static bool ContainsRun(AppConfig config, DateTime value)
         {
+            if (DailyPauseSchedule.IsActive(config))
+            {
+                List<DateTime> times; string error;
+                return DailyPauseSchedule.TrySequence(config, out times, out error) && times.Contains(value);
+            }
             DateTime start;
             if (config == null
                 || config.SequenceCount <= 0
@@ -915,6 +1042,12 @@ namespace CodexQuotaWaker
 
         public static DateTime? LastRun(AppConfig config)
         {
+            if (DailyPauseSchedule.IsActive(config))
+            {
+                List<DateTime> times; string error;
+                return DailyPauseSchedule.TrySequence(config, out times, out error) && times.Count > 0
+                    ? (DateTime?)times[times.Count - 1] : null;
+            }
             DateTime start;
             if (config == null
                 || config.SequenceCount <= 0
@@ -2095,7 +2228,15 @@ namespace CodexQuotaWaker
             }
 
             DateTime start;
-            if (config.SequenceCount > 0 && AppConfig.TryParseSequenceStart(config.SequenceStart, out start))
+            if (DailyPauseSchedule.IsActive(config))
+            {
+                List<DateTime> times; string error;
+                if (!DailyPauseSchedule.TrySequence(config, out times, out error)) return runs;
+                for (int index = 0; index < times.Count; index++)
+                    runs.Add(new PlannedRun { Time = times[index], Source = "序列第 " + (index + 1) + " / " + config.SequenceCount
+                        + " 次；间隔计时已跳过 " + DailyPauseSchedule.Describe(config) });
+            }
+            else if (config.SequenceCount > 0 && AppConfig.TryParseSequenceStart(config.SequenceStart, out start))
             {
                 int intervalMinutes = SequenceSchedule.GetIntervalMinutes(config);
                 for (int index = 0; index < config.SequenceCount; index++)
@@ -2123,11 +2264,11 @@ namespace CodexQuotaWaker
                     PlannedRun duplicate = runs.FirstOrDefault(delegate(PlannedRun item) { return item.Time == extra; });
                     if (duplicate == null)
                     {
-                        runs.Add(new PlannedRun { Time = extra, Source = "插入唤醒" });
+                        runs.Add(new PlannedRun { Time = extra, Source = "插入唤醒（手动指定）" });
                     }
                     else if (duplicate.Source.IndexOf("插入唤醒", StringComparison.Ordinal) < 0)
                     {
-                        duplicate.Source += "；插入唤醒（同一时间已合并）";
+                        duplicate.Source += "；插入唤醒（手动指定，同一时间已合并）";
                     }
                 }
             }
@@ -2144,6 +2285,121 @@ namespace CodexQuotaWaker
                 .Where(delegate(PlannedRun item) { return item.Time > now; })
                 .FirstOrDefault();
             return next == null ? (DateTime?)null : next.Time;
+        }
+    }
+
+    internal static class DailyPauseChecks
+    {
+        internal static AppConfig Fixture(DateTime first, int count)
+        {
+            return new AppConfig { SequenceStart = first.ToString("yyyy-MM-dd HH:mm"), SequenceCount = count,
+                SequenceIntervalMinutes = 300, DailyPauseEnabled = true, DailyPauseStart = "03:00", DailyPauseEnd = "05:00",
+                ScheduleVersion = "8c9e080427344f7a93b2e8f9e3f273c9", Enabled = true };
+        }
+
+        private static DateTime Oracle(DateTime value, int minutes, int start, int end)
+        {
+            Func<DateTime, bool> inside = t => start < end
+                ? t.Hour * 60 + t.Minute >= start && t.Hour * 60 + t.Minute < end
+                : t.Hour * 60 + t.Minute >= start || t.Hour * 60 + t.Minute < end;
+            while (minutes > 0)
+            {
+                bool paused = inside(value);
+                value = value.AddMinutes(1);
+                if (!paused) minutes--;
+            }
+            while (inside(value)) value = value.AddMinutes(1);
+            return value;
+        }
+
+        internal static bool Verify(out string evidence)
+        {
+            bool ok = true; List<string> checks = new List<string>();
+            Action<string, bool> check = (name, passed) => { checks.Add(name + "=" + passed); ok &= passed; };
+            DateTime day = new DateTime(2026, 10, 12);
+            AppConfig config = Fixture(day, 3);
+            List<PlannedRun> runs = SchedulePlanner.Build(config, day, 1);
+            check("midnightFiveHours", runs.Count == 3 && runs[1].Time == day.AddHours(7) && runs[2].Time == day.AddHours(12));
+            AppConfig two = Fixture(day.AddHours(2), 2);
+            check("twoAmFiveHours", SequenceSchedule.LastRun(two) == day.AddHours(9));
+            AppConfig wrap = Fixture(day.AddHours(22), 2); wrap.DailyPauseStart = "23:00"; wrap.DailyPauseEnd = "02:00";
+            check("acrossMidnight", SequenceSchedule.LastRun(wrap) == day.AddDays(1).AddHours(6));
+            AppConfig boundary = Fixture(day, 2); boundary.SequenceIntervalMinutes = 180;
+            check("leftBoundaryMovesToRight", SequenceSchedule.LastRun(boundary) == day.AddHours(5));
+            AppConfig inWindow = Fixture(day.AddHours(3), 1);
+            check("firstRejectedWithSuggestion", DailyPauseSchedule.Validate(inWindow).Contains("05:00"));
+            AppConfig atEnd = Fixture(day.AddHours(5), 1);
+            check("rightBoundaryAllowed", DailyPauseSchedule.Validate(atEnd) == "");
+            AppConfig same = Fixture(day, 2); same.DailyPauseEnd = same.DailyPauseStart;
+            check("equalInvalid", DailyPauseSchedule.Validate(same).Contains("不能相同"));
+            AppConfig bad = Fixture(day, 2); bad.DailyPauseStart = "broken";
+            check("malformedNotNormalizedAway", DailyPauseSchedule.Validate(AppConfig.Normalize(bad)).Contains("HH:mm"));
+
+            bool oracleMatches = true;
+            foreach (int[] window in new[] { new[] { 180, 300 }, new[] { 1380, 120 }, new[] { 480, 481 } })
+            foreach (int hour in new[] { 0, 2, 5, 12, 22 })
+            foreach (int interval in new[] { 1, 180, 300, 1440, 2880 })
+            {
+                DateTime first = day.AddHours(hour);
+                if (DailyPauseSchedule.Contains(first, window[0], window[1])) continue;
+                DateTime actual = DailyPauseSchedule.Advance(first, interval, window[0], window[1]);
+                oracleMatches &= actual == Oracle(first, interval, window[0], window[1]);
+            }
+            check("independentMinuteOracleMultiDay", oracleMatches);
+            config.ExtraWakeTimes.Add(day.AddHours(3).ToString("yyyy-MM-dd HH:mm"));
+            config.ExtraWakeTimes.Add(day.AddHours(7).ToString("yyyy-MM-dd HH:mm"));
+            runs = SchedulePlanner.Build(config, day, 1);
+            check("manualInsideAndCollision", runs.Count == 4 && runs[1].Time == day.AddHours(3)
+                && runs[1].Source.Contains("手动指定") && runs[2].Source.Contains("序列第 2") && runs[2].Source.Contains("手动指定"));
+            string xml = TaskXml.Build(config, AppPaths.InstalledExePath, "fixture");
+            XmlDocument document = new XmlDocument(); document.LoadXml(xml);
+            List<DateTime> actualTriggers = document.SelectNodes("//*[local-name()='TimeTrigger']/*[local-name()='StartBoundary']")
+                .Cast<XmlNode>().Select(n => DateTime.Parse(n.InnerText, CultureInfo.InvariantCulture)).ToList();
+            check("xmlMatchesEveryPreviewItem", actualTriggers.SequenceEqual(runs.Select(r => r.Time)) && !xml.Contains("<Repetition>"));
+            check("nextAndMembershipUsePausedTimes", SequenceSchedule.NextRun(config, day) == day.AddHours(7)
+                && SequenceSchedule.ContainsRun(config, day.AddHours(7)) && !SequenceSchedule.ContainsRun(config, day.AddHours(5)));
+            WindowsTaskStatus status = new WindowsTaskStatus { Exists = true, DefinitionXml = xml, Enabled = true, WakeToRun = true };
+            check("installedDefinitionAndVersion", TimelineExecutionPolicy.InstalledMatches(config, status));
+            DateTime savedUtc = day.AddDays(-1).ToUniversalTime();
+            string planKey = TimelineExecutionPolicy.PlanKey(config, savedUtc);
+            List<TimelineExecution> claimed = new List<TimelineExecution> {
+                new TimelineExecution { PlanKey = planKey, PlannedTime = day.ToString("yyyy-MM-dd HH:mm") },
+                new TimelineExecution { PlanKey = planKey, PlannedTime = day.AddHours(3).ToString("yyyy-MM-dd HH:mm") }
+            };
+            status.LastRunTime = day.AddHours(7);
+            PlannedRun associated = TimelineExecutionPolicy.Associate(config, status, day.AddHours(7).AddSeconds(5), savedUtc, claimed, config.ScheduleVersion);
+            check("pausedTimelineAssociation", associated != null && associated.Time == day.AddHours(7)
+                && associated.Source.Contains("手动指定")
+                && TimelineExecutionPolicy.Associate(config, status, day.AddHours(7).AddSeconds(5), savedUtc, claimed, "old-version") == null);
+            AppConfig changed = Fixture(day, 3); changed.DailyPauseEnd = "06:00";
+            check("changedWindowRejectsOldDefinition", !TimelineExecutionPolicy.InstalledMatches(changed, status));
+            changed = Fixture(day, 3); changed.ScheduleVersion = Guid.NewGuid().ToString("N");
+            check("newPlanRejectsOldResult", !TimelineExecutionPolicy.InstalledMatches(changed, status)
+                && TimelineExecutionPolicy.PlanKey(changed, day.ToUniversalTime()) != TimelineExecutionPolicy.PlanKey(config, day.ToUniversalTime()));
+
+            AppConfig zero = Fixture(day.AddHours(3), 0); zero.ExtraWakeTimes.Add(day.AddHours(3).ToString("yyyy-MM-dd HH:mm"));
+            check("zeroOnlyManual", DailyPauseSchedule.Validate(zero) == "" && SchedulePlanner.Build(zero, day, 1).Single().Time == day.AddHours(3));
+            AppConfig old = new JavaScriptSerializer().Deserialize<AppConfig>("{\"SequenceStart\":\"2026-10-12 00:00\",\"SequenceCount\":60,\"SequenceIntervalMinutes\":300}");
+            string original = TaskXml.Build(old, AppPaths.InstalledExePath, "fixture");
+            old.DailyPauseStart = "invalid"; old.DailyPauseEnd = "invalid";
+            check("legacyMissingAndDisabledUnchanged", !old.DailyPauseEnabled && original == TaskXml.Build(old, AppPaths.InstalledExePath, "fixture")
+                && DailyPauseSchedule.Validate(old) == "" && SequenceSchedule.LastRun(old) == day.AddMinutes(59L * 300));
+            AppConfig limit = Fixture(day, 48);
+            check("exactly48Allowed", DailyPauseSchedule.Validate(limit) == "");
+            limit.ExtraWakeTimes.Add(day.AddHours(3).ToString("yyyy-MM-dd HH:mm"));
+            check("49MergedRejected", DailyPauseSchedule.Validate(limit).Contains("当前共 49"));
+            AppConfig tooMany = Fixture(DateTime.Today.AddDays(4), 49);
+            OperationResult rejected = WindowsTaskService.InstallOrUpdate(tooMany);
+            check("failedSaveBeforeRegistration", !rejected.Success && rejected.Message.Contains("原有计划未修改"));
+
+            TimeZoneInfo.TransitionTime spring = TimeZoneInfo.TransitionTime.CreateFloatingDateRule(new DateTime(1, 1, 1, 2, 0, 0), 3, 2, DayOfWeek.Sunday);
+            TimeZoneInfo.TransitionTime fall = TimeZoneInfo.TransitionTime.CreateFloatingDateRule(new DateTime(1, 1, 1, 2, 0, 0), 11, 1, DayOfWeek.Sunday);
+            TimeZoneInfo zone = TimeZoneInfo.CreateCustomTimeZone("fixture-DST", TimeSpan.FromHours(-5), "fixture", "standard", "summer",
+                new[] { TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(new DateTime(2020, 1, 1), new DateTime(2030, 12, 31), TimeSpan.FromHours(1), spring, fall) });
+            AppConfig gap = Fixture(new DateTime(2026, 3, 8, 1, 0, 0), 2); gap.SequenceIntervalMinutes = 60; gap.DailyPauseStart = "10:00"; gap.DailyPauseEnd = "11:00";
+            AppConfig ambiguous = Fixture(new DateTime(2026, 11, 1, 1, 0, 0), 1); ambiguous.DailyPauseStart = "10:00"; ambiguous.DailyPauseEnd = "11:00";
+            check("dstInvalidAndAmbiguousRejected", DailyPauseSchedule.Validate(gap, zone).Contains("夏令时") && DailyPauseSchedule.Validate(ambiguous, zone).Contains("歧义"));
+            evidence = string.Join("; ", checks); return ok;
         }
     }
 
@@ -4103,6 +4359,9 @@ namespace CodexQuotaWaker
         public DateTime SequenceStart { get; set; }
         public int SequenceIntervalMinutes { get; set; }
         public List<string> ExtraWakeTimes { get; set; }
+        public bool DailyPauseEnabled { get; set; }
+        public string DailyPauseStart { get; set; }
+        public string DailyPauseEnd { get; set; }
     }
 
     internal static class ManualTestSchedulePolicy
@@ -4136,7 +4395,9 @@ namespace CodexQuotaWaker
             if (first == null || second == null
                 || !string.Equals(first.SequenceCountText, second.SequenceCountText, StringComparison.Ordinal)
                 || first.SequenceStart != second.SequenceStart
-                || first.SequenceIntervalMinutes != second.SequenceIntervalMinutes)
+                || first.SequenceIntervalMinutes != second.SequenceIntervalMinutes
+                || first.DailyPauseEnabled != second.DailyPauseEnabled
+                || first.DailyPauseStart != second.DailyPauseStart || first.DailyPauseEnd != second.DailyPauseEnd)
             {
                 return false;
             }
@@ -4452,6 +4713,8 @@ namespace CodexQuotaWaker
 
         public static string Build(AppConfig config, string executablePath, string userSid)
         {
+            string pauseError = DailyPauseSchedule.Validate(config);
+            if (pauseError.Length > 0) throw new ArgumentException(pauseError);
             StringBuilder xml = new StringBuilder();
             xml.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-16\"?>");
             xml.AppendLine("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
@@ -4461,7 +4724,17 @@ namespace CodexQuotaWaker
             xml.AppendLine("  </RegistrationInfo>");
             xml.AppendLine("  <Triggers>");
             DateTime sequenceStart;
-            if (config.SequenceCount > 0 && AppConfig.TryParseSequenceStart(config.SequenceStart, out sequenceStart))
+            if (DailyPauseSchedule.IsActive(config))
+            {
+                foreach (PlannedRun run in SchedulePlanner.Build(config, DateTime.MinValue, 1))
+                {
+                    xml.AppendLine("    <TimeTrigger>");
+                    xml.AppendLine("      <StartBoundary>" + run.Time.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture) + "</StartBoundary>");
+                    xml.AppendLine("      <Enabled>true</Enabled>");
+                    xml.AppendLine("    </TimeTrigger>");
+                }
+            }
+            else if (config.SequenceCount > 0 && AppConfig.TryParseSequenceStart(config.SequenceStart, out sequenceStart))
             {
                 xml.AppendLine("    <TimeTrigger>");
                 if (config.SequenceCount > 1)
@@ -4479,6 +4752,7 @@ namespace CodexQuotaWaker
             }
             foreach (string value in AppConfig.NormalizeDateTimes(config.ExtraWakeTimes))
             {
+                if (DailyPauseSchedule.IsActive(config)) break;
                 DateTime extra;
                 if (!AppConfig.TryParseDateTime(value, out extra))
                 {
@@ -5440,6 +5714,8 @@ namespace CodexQuotaWaker
             string password = string.Empty;
             try
             {
+                string pauseError = DailyPauseSchedule.Validate(config);
+                if (pauseError.Length > 0) return Fail(pauseError + "\r\n原有计划未修改。请调整后重新保存。");
                 config = AppConfig.Normalize(config);
                 bool existed = Exists();
                 bool hasSequence = config.SequenceCount > 0;
@@ -6037,7 +6313,7 @@ namespace CodexQuotaWaker
                 List<PlannedRun> planned = SchedulePlanner.Build(sequence, new DateTime(2026, 9, 6, 0, 0, 0), 1);
                 bool timelineOk = planned.Count == 4
                     && planned[0].Time == new DateTime(2026, 9, 6, 2, 15, 0)
-                    && planned[3].Source == "插入唤醒";
+                    && planned[3].Source == "插入唤醒（手动指定）";
                 lines.Add("MergedTimeline=" + timelineOk);
                 success = success && timelineOk;
 
@@ -6137,6 +6413,16 @@ namespace CodexQuotaWaker
                 lines.Add("WakeReadinessEvidence=" + wakeReadinessEvidence);
                 lines.Add("WakeReadiness=" + wakeReadinessOk);
                 success = success && wakeReadinessOk;
+                string pauseEvidence;
+                bool pauseOk = DailyPauseChecks.Verify(out pauseEvidence);
+                lines.Add("DailyPauseEvidence=" + pauseEvidence);
+                lines.Add("DailyPause=" + pauseOk);
+                success &= pauseOk;
+                string pauseLayoutEvidence;
+                bool pauseLayoutOk = MainForm.VerifyDailyPauseLayout(out pauseLayoutEvidence);
+                lines.Add("DailyPauseLayoutEvidence=" + pauseLayoutEvidence);
+                lines.Add("DailyPauseLayout=" + pauseLayoutOk);
+                success &= pauseLayoutOk;
                 string wakeReadinessLayoutEvidence;
                 bool wakeReadinessLayoutOk = MainForm.VerifyWakeReadinessLayout(out wakeReadinessLayoutEvidence);
                 lines.Add("WakeReadinessLayoutEvidence=" + wakeReadinessLayoutEvidence);
@@ -6456,6 +6742,10 @@ namespace CodexQuotaWaker
         private NumericUpDown sequenceIntervalHoursBox;
         private NumericUpDown sequenceIntervalMinutesBox;
         private readonly Label sequenceSummaryLabel;
+        private readonly CheckBox dailyPauseCheck;
+        private readonly DateTimePicker dailyPauseStartPicker;
+        private readonly DateTimePicker dailyPauseEndPicker;
+        private readonly FlowLayoutPanel dailyPauseInputs;
         private readonly DateTimePicker extraWakeDatePicker;
         private readonly DateTimePicker extraWakeTimePicker;
         private readonly Button addExtraWakeButton;
@@ -6564,7 +6854,7 @@ namespace CodexQuotaWaker
             Panel scheduleCard = NewCard("安排唤醒", out scheduleBody, 570);
             sequenceSchedulePanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
             scheduleBody.Controls.Add(sequenceSchedulePanel);
-            TableLayoutPanel scheduleLayout = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 7, Padding = new Padding(0, 2, 0, 0) };
+            TableLayoutPanel scheduleLayout = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 8, Padding = new Padding(0, 2, 0, 0) };
             scheduleLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             scheduleLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -6608,9 +6898,30 @@ namespace CodexQuotaWaker
             planFields.Controls.Add(countField);
             scheduleLayout.Controls.Add(planFields, 0, 1);
 
+            FlowLayoutPanel pauseBlock = NewFlow(true);
+            dailyPauseCheck = new CheckBox { Text = "每天暂停间隔计时 · 仅这份序列计划", AutoSize = true, Margin = new Padding(0, 0, 0, 5) };
+            dailyPauseInputs = NewFlow(false);
+            dailyPauseInputs.WrapContents = true;
+            dailyPauseInputs.Visible = false;
+            dailyPauseStartPicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 95 };
+            dailyPauseEndPicker = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm", ShowUpDown = true, Width = 95 };
+            dailyPauseStartPicker.Value = DateTime.Today.AddHours(3);
+            dailyPauseEndPicker.Value = DateTime.Today.AddHours(5);
+            dailyPauseInputs.Controls.Add(dailyPauseStartPicker);
+            dailyPauseInputs.Controls.Add(new Label { Text = "至", AutoSize = true, Margin = new Padding(7, 5, 7, 0) });
+            dailyPauseInputs.Controls.Add(dailyPauseEndPicker);
+            dailyPauseInputs.Controls.Add(new Label { Text = "可跨午夜；额外手动时间照常执行", AutoSize = true, Margin = new Padding(7, 5, 0, 0) });
+            pauseBlock.Controls.Add(dailyPauseCheck);
+            pauseBlock.Controls.Add(dailyPauseInputs);
+            scheduleLayout.Controls.Add(pauseBlock, 0, 2);
+            scheduleLayout.RowStyles.Insert(2, new RowStyle(SizeType.AutoSize));
+            dailyPauseCheck.CheckedChanged += delegate { dailyPauseInputs.Visible = dailyPauseCheck.Checked; UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            dailyPauseStartPicker.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+            dailyPauseEndPicker.ValueChanged += delegate { UpdateSequenceSummary(); UpdateDraftTimeline(DateTime.Now); MarkDraftChanged(); };
+
             sequenceSummaryLabel = new Label { AutoSize = true, MaximumSize = new Size(640, 0), ForeColor = Purple, BackColor = Color.FromArgb(245, 242, 253), Padding = new Padding(11, 8, 11, 8), Margin = new Padding(0, 2, 0, 12), Font = new Font("Microsoft YaHei UI", 9F) };
-            scheduleLayout.Controls.Add(sequenceSummaryLabel, 0, 2);
-            scheduleLayout.Controls.Add(new Label { Text = "额外唤醒 · 可选", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0, 3, 0, 4) }, 0, 3);
+            scheduleLayout.Controls.Add(sequenceSummaryLabel, 0, 3);
+            scheduleLayout.Controls.Add(new Label { Text = "额外唤醒 · 可选", AutoSize = true, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), ForeColor = Ink, Margin = new Padding(0, 3, 0, 4) }, 0, 4);
             FlowLayoutPanel extraWakeActions = NewFlow(false);
             extraWakeActions.WrapContents = true;
             extraWakeActions.Margin = new Padding(0, 0, 0, 5);
@@ -6624,9 +6935,9 @@ namespace CodexQuotaWaker
             extraWakeActions.Controls.Add(extraWakeTimePicker);
             extraWakeActions.Controls.Add(addExtraWakeButton);
             extraWakeActions.Controls.Add(removeExtraWakeButton);
-            scheduleLayout.Controls.Add(extraWakeActions, 0, 4);
+            scheduleLayout.Controls.Add(extraWakeActions, 0, 5);
             extraWakeList = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Microsoft YaHei UI", 9F), BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, 4, 0, 10) };
-            scheduleLayout.Controls.Add(extraWakeList, 0, 5);
+            scheduleLayout.Controls.Add(extraWakeList, 0, 6);
 
             FlowLayoutPanel planActions = NewFlow(false);
             planActions.WrapContents = true;
@@ -6638,7 +6949,7 @@ namespace CodexQuotaWaker
             pauseButton.Click += delegate { PauseSchedule(); };
             planActions.Controls.Add(saveButton);
             planActions.Controls.Add(pauseButton);
-            scheduleLayout.Controls.Add(planActions, 0, 6);
+            scheduleLayout.Controls.Add(planActions, 0, 7);
 
             Panel advancedCardBody;
             advancedCard = NewCard("更多设置", out advancedCardBody, 120);
@@ -6902,6 +7213,8 @@ namespace CodexQuotaWaker
             FitInstalledContent();
             planDetailLabel.MaximumSize = new Size(Math.Max(180, rightContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
             sequenceSummaryLabel.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64), 0);
+            dailyPauseInputs.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
+            dailyPauseCheck.MaximumSize = new Size(Math.Max(180, leftContentWidth - 64 - SystemInformation.VerticalScrollBarWidth), 0);
 
             int leftHeight = leftStack.Height + leftStack.Margin.Vertical;
             int rightHeight = rightStack.Height + rightStack.Margin.Vertical;
@@ -7488,7 +7801,7 @@ namespace CodexQuotaWaker
                     bool zeroWithExtraWorks = zeroWithExtra.SequenceCount == 0
                         && extraOnlyPlan.Count == 1
                         && extraOnlyPlan[0].Time == extraWake
-                        && extraOnlyPlan[0].Source == "插入唤醒";
+                        && extraOnlyPlan[0].Source == "插入唤醒（手动指定）";
 
                     evidence = "blankRejected=" + blankRejected
                         + "; zeroAccepted=" + zeroAccepted
@@ -7722,6 +8035,54 @@ namespace CodexQuotaWaker
             return ok;
         }
 
+        internal static bool VerifyDailyPauseLayout(out string evidence)
+        {
+            bool ok = true; List<string> checks = new List<string>();
+            foreach (int width in new[] { 1420, 760 })
+            foreach (float scale in new[] { 1F, 1.5F })
+            using (MainForm form = new MainForm())
+            {
+                form.ShowInTaskbar = false;
+                if (scale != 1F) { form.Scale(new SizeF(scale, scale)); form.Font = new Font("Microsoft YaHei UI", 9F * scale); }
+                form.ClientSize = new Size(width, 620);
+                IntPtr handle = form.Handle; EnsureControlHandles(form);
+                DateTime day = DateTime.Today.AddDays(4);
+                form.config = DailyPauseChecks.Fixture(day, 3);
+                form.modelBox.Text = AppConfig.DefaultRequestModel;
+                form.promptBox.Text = "Respond with OK.";
+                form.sequenceDatePicker.Value = day;
+                form.sequenceTimePicker.Value = day;
+                form.sequenceCountBox.Text = "3";
+                form.sequenceIntervalHoursBox.Value = 5;
+                form.sequenceIntervalMinutesBox.Value = 0;
+                form.dailyPauseCheck.Checked = true;
+                form.LayoutResponsive(); PerformLayoutTree(form);
+                AppConfig draft = form.ReadForm(false);
+                bool planned = SequenceSchedule.LastRun(draft) == day.AddHours(12)
+                    && form.sequenceSummaryLabel.Text.Contains("03:00–05:00") && form.ValidateForm(true, false);
+                Rectangle inputs = BoundsInAncestor(form.dailyPauseInputs, form.sequenceSchedulePanel);
+                bool fits = inputs.Width <= form.sequenceSchedulePanel.ClientSize.Width;
+                form.sequenceSchedulePanel.ScrollControlIntoView(form.dailyPauseStartPicker); PerformLayoutTree(form);
+                bool inputsReachable = form.sequenceSchedulePanel.ClientRectangle.IntersectsWith(BoundsInAncestor(form.dailyPauseStartPicker, form.sequenceSchedulePanel));
+                form.sequenceSchedulePanel.ScrollControlIntoView(form.saveButton); PerformLayoutTree(form);
+                bool saveReachable = form.sequenceSchedulePanel.ClientRectangle.IntersectsWith(BoundsInAncestor(form.saveButton, form.sequenceSchedulePanel));
+                form.sequenceTimePicker.Value = day.AddHours(3);
+                bool invalid = !form.ValidateForm(true, false) && form.ReadForm(false).SequenceStart.EndsWith("03:00")
+                    && form.sequenceSummaryLabel.Text.Contains("最早可用时间");
+                // Invalid persisted data also cannot invent an execution-history key.
+                form.UpdateTimeline(DateTime.Now, form.ReadForm(false), false);
+                invalid &= form.timelineList.Items.Count == 0;
+                form.sequenceCountBox.Text = "0";
+                form.extraWakeList.Items.Add(day.AddHours(3).ToString("yyyy-MM-dd HH:mm")); form.UpdateSequenceSummary();
+                bool zero = form.ValidateForm(true, false) && form.sequenceSummaryLabel.Text.Contains("没有效果");
+                bool passed = planned && fits && inputsReachable && saveReachable && invalid && zero;
+                checks.Add(width + "/" + scale + ":plan=" + planned + ",fits=" + fits + ",inputs=" + inputsReachable
+                    + ",save=" + saveReachable + ",invalidDraft=" + invalid + ",zero=" + zero);
+                ok &= passed;
+            }
+            evidence = string.Join("; ", checks); return ok;
+        }
+
         internal static bool VerifyWakeReadinessLayout(out string evidence)
         {
             bool ok = true;
@@ -7870,19 +8231,29 @@ namespace CodexQuotaWaker
                         PlannedTime = start.AddHours(index).ToString("yyyy-MM-dd HH:mm"), StartedAt = now.ToString("o"),
                         State = index == 0 ? "success" : index == 1 ? "failure" : "running", OwnerPid = owner.Id,
                         OwnerStartedAt = owner.StartTime.ToUniversalTime().ToString("o"), ExpiresAt = new DateTimeOffset(now.AddMinutes(5)).ToString("o") });
-                string before = JsonStore.Serialize(fixture);
+                string before = StablePropertySnapshot(fixture);
                 form.UpdateTimeline(now, fixture, false);
                 string[] actual = form.timelineList.Items.Cast<ListViewItem>().Select(delegate(ListViewItem row) { return row.Text; }).ToArray();
                 bool states = actual.SequenceEqual(new[] { "执行成功", "执行失败", "执行中", TimelineExecutionPolicy.Unknown, TimelineExecutionPolicy.Unknown, "下一次", "待执行" });
                 bool textFits = form.timelineList.Columns[0].Width >= TextRenderer.MeasureText(TimelineExecutionPolicy.Unknown, form.timelineList.Font).Width;
                 form.UpdateTimeline(now, fixture, true);
-                bool draft = form.timelineList.Items.Cast<ListViewItem>().Take(5).All(delegate(ListViewItem row) { return row.Text == TimelineExecutionPolicy.Unknown; })
-                    && form.timelineSummaryLabel.Text.Contains("预览") && JsonStore.Serialize(fixture) == before;
-                checks.Add(scale + ":states=" + states + ",statusFits=" + textFits + ",draftSeparated=" + draft);
+                bool draftStates = form.timelineList.Items.Cast<ListViewItem>().Take(5).All(delegate(ListViewItem row) { return row.Text == TimelineExecutionPolicy.Unknown; });
+                bool draftSummary = form.timelineSummaryLabel.Text.Contains("预览");
+                bool fixtureUnchanged = StablePropertySnapshot(fixture) == before;
+                bool draft = draftStates && draftSummary && fixtureUnchanged;
+                checks.Add(scale + ":states=" + states + ",statusFits=" + textFits + ",draftSeparated=" + draft
+                    + ",draftStates=" + draftStates + ",draftSummary=" + draftSummary + ",fixture=" + fixtureUnchanged);
                 ok = ok && states && textFits && draft;
             }
             evidence = string.Join("; ", checks);
             return ok;
+        }
+
+        private static string StablePropertySnapshot(object value)
+        {
+            // JavaScriptSerializer property enumeration order is not a data invariant.
+            return string.Join(";", value.GetType().GetProperties().OrderBy(p => p.Name, StringComparer.Ordinal)
+                .Select(p => p.Name + "=" + JsonStore.Serialize(p.GetValue(value, null))));
         }
 
         internal static bool VerifyResultPlanNavigation(out string evidence)
@@ -7896,15 +8267,17 @@ namespace CodexQuotaWaker
                 ManualTestScheduleSnapshot before = form.CaptureManualTestScheduleSnapshot();
                 string modelBefore = form.modelBox.Text;
                 string promptBefore = form.promptBox.Text;
-                string configBefore = JsonStore.Serialize(form.config);
+                string configBefore = StablePropertySnapshot(form.config);
                 bool dirtyBefore = form.hasUnsavedChanges;
                 form.NavigateToPlan();
                 ManualTestScheduleSnapshot after = form.CaptureManualTestScheduleSnapshot();
-                bool unchanged = JsonStore.Serialize(before) == JsonStore.Serialize(after) && modelBefore == form.modelBox.Text
-                    && promptBefore == form.promptBox.Text && configBefore == JsonStore.Serialize(form.config)
+                bool unchanged = StablePropertySnapshot(before) == StablePropertySnapshot(after) && modelBefore == form.modelBox.Text
+                    && promptBefore == form.promptBox.Text && configBefore == StablePropertySnapshot(form.config)
                     && dirtyBefore == form.hasUnsavedChanges;
                 bool reachable = form.viewport.ClientRectangle.IntersectsWith(BoundsInAncestor(form.sequenceDatePicker, form.viewport));
-                evidence = "draftAndConfigUnchanged=" + unchanged + "; planReachable=" + reachable;
+                evidence = "draftAndConfigUnchanged=" + unchanged + "; planReachable=" + reachable
+                    + "; snapshot=" + (StablePropertySnapshot(before) == StablePropertySnapshot(after))
+                    + "; config=" + (configBefore == StablePropertySnapshot(form.config)) + "; dirty=" + (dirtyBefore == form.hasUnsavedChanges);
                 return unchanged && reachable;
             }
         }
@@ -8317,6 +8690,10 @@ namespace CodexQuotaWaker
                 sequenceIntervalHoursBox.Maximum,
                 Math.Max(sequenceIntervalHoursBox.Minimum, config.SequenceIntervalMinutes / 60));
             sequenceIntervalMinutesBox.Value = config.SequenceIntervalMinutes % 60;
+            DateTime pauseTime;
+            if (DateTime.TryParseExact(config.DailyPauseStart, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out pauseTime)) dailyPauseStartPicker.Value = pauseTime;
+            if (DateTime.TryParseExact(config.DailyPauseEnd, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out pauseTime)) dailyPauseEndPicker.Value = pauseTime;
+            dailyPauseCheck.Checked = config.DailyPauseEnabled;
             extraWakeList.Items.Clear();
             foreach (string value in AppConfig.NormalizeDateTimes(config.ExtraWakeTimes))
             {
@@ -8634,6 +9011,7 @@ namespace CodexQuotaWaker
             detail.Append("；Windows 上次运行：").Append(FormatTaskTime(taskStatus.LastRunTime));
             detail.Append("\r\n计划：");
             detail.Append("序列 ").Append(config.SequenceCount).Append(" 次");
+            if (DailyPauseSchedule.IsActive(config)) detail.Append("；每天暂停间隔计时 ").Append(DailyPauseSchedule.Describe(config));
             if (config.SequenceCount > 1)
             {
                 detail.Append("，间隔 ").Append(FormatInterval(SequenceSchedule.GetIntervalMinutes(config)));
@@ -8698,7 +9076,9 @@ namespace CodexQuotaWaker
             }
 
             List<PlannedRun> plan = SchedulePlanner.Build(preview, now, 14);
-            string timelineKey = TimelineExecutionPolicy.PlanKey(preview, timelineSavedUtc);
+            // Draft entries do not consume execution history and may not yet be valid tasks.
+            string timelineKey = draft || DailyPauseSchedule.Validate(preview).Length > 0
+                ? "" : TimelineExecutionPolicy.PlanKey(preview, timelineSavedUtc);
             PlannedRun heroNext = plan.FirstOrDefault(delegate(PlannedRun item) { return item.Time > now; });
             DateTime? displayNext = draft ? (heroNext == null ? (DateTime?)null : heroNext.Time)
                 : installedTaskExists && installedTaskEnabled ? installedNextRunTime
@@ -8801,6 +9181,13 @@ namespace CodexQuotaWaker
             return ((int)sequenceIntervalHoursBox.Value * 60) + (int)sequenceIntervalMinutesBox.Value;
         }
 
+        private void ApplyPauseInputs(AppConfig value)
+        {
+            value.DailyPauseEnabled = dailyPauseCheck != null && dailyPauseCheck.Checked;
+            value.DailyPauseStart = dailyPauseStartPicker == null ? "03:00" : dailyPauseStartPicker.Value.ToString("HH:mm");
+            value.DailyPauseEnd = dailyPauseEndPicker == null ? "05:00" : dailyPauseEndPicker.Value.ToString("HH:mm");
+        }
+
         private static string FormatInterval(int totalMinutes)
         {
             int hours = totalMinutes / 60;
@@ -8894,9 +9281,17 @@ namespace CodexQuotaWaker
             preview.SequenceStart = ReadSequenceStart().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
             preview.SequenceCount = count;
             preview.SequenceIntervalMinutes = ReadSequenceIntervalMinutes();
+            ApplyPauseInputs(preview);
             preview.ExtraWakeTimes = extraWakeList == null
                 ? new List<string>()
                 : AppConfig.NormalizeDateTimes(extraWakeList.Items.Cast<string>());
+            string pauseError = DailyPauseSchedule.Validate(preview);
+            if (pauseError.Length > 0)
+            {
+                sequenceSummaryLabel.Text = pauseError + " 尚未保存；当前 Windows 计划不变。";
+                sequenceSummaryLabel.ForeColor = Color.FromArgb(180, 55, 55);
+                return;
+            }
             int totalCount = SchedulePlanner.Build(preview, DateTime.MinValue, 1).Count;
             if (count == 0)
             {
@@ -8905,7 +9300,7 @@ namespace CodexQuotaWaker
                 sequenceNowButton.Enabled = SequenceStartShortcut.IsEnabled();
                 sequenceIntervalHoursBox.Enabled = true;
                 sequenceIntervalMinutesBox.Enabled = true;
-                sequenceSummaryLabel.Text = "序列执行 0 次；额外唤醒 " + extraCount + " 条，去重后共 " + totalCount + " 次，每条只执行一次。";
+                sequenceSummaryLabel.Text = "序列执行 0 次；额外唤醒 " + extraCount + " 条，去重后共 " + totalCount + " 次，每条只执行一次。" + (preview.DailyPauseEnabled ? " 暂停计时对 0 次序列没有效果。" : "");
                 sequenceSummaryLabel.ForeColor = extraCount > 0
                     ? Color.FromArgb(80, 84, 92)
                     : Color.FromArgb(160, 100, 20);
@@ -8929,6 +9324,7 @@ namespace CodexQuotaWaker
                 ? "序列执行 1 次（首次时间）；额外唤醒 " + extraCount + " 条，去重后共 " + totalCount + " 次。"
                 : "每隔 " + FormatInterval(preview.SequenceIntervalMinutes) + "，序列执行 " + count + " 次（含首次），最后一次：" + last.Value.ToString("yyyy-MM-dd HH:mm") + "；额外唤醒 " + extraCount + " 条，去重后共 " + totalCount + " 次。";
             sequenceSummaryLabel.ForeColor = Color.FromArgb(80, 84, 92);
+            if (DailyPauseSchedule.IsActive(preview)) sequenceSummaryLabel.Text += " 间隔计时已跳过 " + DailyPauseSchedule.Describe(preview) + "（每天）；额外时间手动指定。";
         }
 
         private AppConfig ReadForm(bool enabled)
@@ -8952,6 +9348,7 @@ namespace CodexQuotaWaker
                 ? sequenceCount
                 : 0;
             value.SequenceIntervalMinutes = ReadSequenceIntervalMinutes();
+            ApplyPauseInputs(value);
             value.ExtraWakeTimes = AppConfig.NormalizeDateTimes(extraWakeList.Items.Cast<string>());
             return AppConfig.Normalize(value);
         }
@@ -8991,6 +9388,9 @@ namespace CodexQuotaWaker
             }
 
             List<string> extras = AppConfig.NormalizeDateTimes(extraWakeList.Items.Cast<string>());
+            AppConfig pausedPreview = ReadForm(false);
+            string pausedError = DailyPauseSchedule.Validate(pausedPreview);
+            if (pausedError.Length > 0) return RejectValidation(pausedError + "\r\n当前 Windows 计划未修改。", dailyPauseStartPicker, showMessages);
             if (requireTime)
             {
                 bool hasSequence = count > 0;
@@ -9045,6 +9445,9 @@ namespace CodexQuotaWaker
                 SequenceCountText = sequenceCountBox.Text,
                 SequenceStart = ReadSequenceStart(),
                 SequenceIntervalMinutes = ReadSequenceIntervalMinutes(),
+                DailyPauseEnabled = dailyPauseCheck.Checked,
+                DailyPauseStart = dailyPauseStartPicker.Value.ToString("HH:mm"),
+                DailyPauseEnd = dailyPauseEndPicker.Value.ToString("HH:mm"),
                 ExtraWakeTimes = AppConfig.NormalizeDateTimes(extraWakeList.Items.Cast<string>())
             };
         }
