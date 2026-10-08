@@ -58,3 +58,6 @@
 - 不变性证据：正式任务 XML SHA-256 仍为 `3D28741D764E664212A35978CEA8EA1E65F23649E0B6239F0E593CDEEAA8C30F`；任务 Execute/Arguments/WorkingDirectory、应用目录六个数据文件的长度与 SHA-256、活动电源方案/睡眠支持/睡眠及合盖设置输出均与本轮基线一致。后台副本更新没有重新登记用户任务。专属临时任务已删除。
 - 未验证：真实 Codex 请求、真实睡眠唤醒、桌面视觉验收；本轮无桌面控制、用户任务或电源设置修改、git push。用户打开原入口可查看暂停设置并自行保存；现有计划未自动启用暂停。
 - 开发停止事件 `SCHED-001-20261008-delivered`：实现、集成与原路径部署完成，验收待用户；无活动工作命令/进程，无子代理，执行槽释放。产品反馈将记录发送回执；本条不把待用户验收写成产品已验收。
+- 实现提交：`bef0c26c5eff24aea836dc52fec7524193923dc2`；本地 tag `v0.20.0` 解析到该提交，无 push。Git 自动维护另报已有 Codex checkpoint 引用缺失对象；此次提交与标签均可读取，未修改该内部引用，后续 Git 维护需单独核对。
+- 临时产物清理限制：专用 Windows 测试任务已经验证脚本清理；删除 `dist/CodexQuotaWaker-sched-validation.exe`、`sched-self-check.txt`、`sched-verification.txt` 被自动审批拒绝，只返回 `blocked by policy`。这些本地忽略文件保留，不作为正式入口；正式验证证据保留于 `dist/self-check.txt` 与 `dist/sched-formal-verification.txt`。
+- 产品反馈回执：2026-10-08 已向工作流绑定产品聊天 `01a1012e-b555-7490-a340-5264a4da3c7b` 发送上述交付、验证、未验收项、清理/Git 限制及释放执行槽的实质报告，工具成功返回同一 threadId；没有扩大发送范围或自行派发下一需求。
