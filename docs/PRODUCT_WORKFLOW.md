@@ -1,5 +1,19 @@
 # Product workflow
 
+## 2026-10-08 SCHED-001 已交付，待验收
+
+- 用户明确按每份有限序列计划单独设置，且只在该计划内每天暂停间隔计时；额外手动单次时间照常执行。权威需求 `docs/requirements/REQ-20261008-daily-excluded-window.md` 已经 2026-10-08 确认；用户在当前确认卡下回复“用 medium”，即批准 `gpt-6.1-sol / medium` 自定义档位和本版规则。
+- WAKE-001 交付后，2026-10-08 复核开发聊天空闲并以 `gpt-6.1-sol / medium` 派发 SCHED-001 权威需求；当时 FIFO 队列清空，共享基线为 `9cc63b0d887c582896493ae45cb82eb0ea037af9`。
+- 事件 `SCHED-001-20261008-delivered`：开发聊天完成实现、集成和固定原路径 0.20.0 交付，状态 `implementation_completed / awaiting_acceptance`；实现提交 `bef0c26c5eff24aea836dc52fec7524193923dc2`、本地 tag `v0.20.0`。正式构建、verify（含 48 条触发器实登记与预览逐项一致、49 条失败拦截）和隐藏布局检查通过；原 EXE 与任务引用后台副本版本、SHA-256 一致。现有用户任务 XML、应用数据及电源设置未改；没有真实请求、真实睡眠唤醒、桌面视觉或 push。详情见权威需求开发记录；执行槽已释放，当前无需求在开发。开发反馈提及 Git 自动维护报告 Codex checkpoint 引用缺失对象，未影响此次提交与交付，后续维护单独核对。
+
+## 2026-10-08 WAKE-001 已交付，待验收
+
+- 用户要求查看剩余需求并继续逐项优化；产品优先细化唤醒条件检查，因为它关系到合盖/睡眠/电池状态下的核心功能可信度。权威需求 `docs/requirements/REQ-20261008-wake-readiness.md` 已于 2026-10-08 经用户回复选项 `0` 确认，批准 `gpt-6-luna / max`、单聊天串行、只读系统检查与非桌面验证；已成功派发到原开发聊天，作为当前唯一在开发需求。
+- 开发聊天 `01a10130-e18a-7860-8690-0ed3fc4a1593` 在本次产品检查中为 idle，RESULT-001 已交付待验收，执行槽释放。共享 `main` 基线 `ed71536d9f9ebcde9b7b058ed46762cbbe6373e2`，其他未提交产品规划保留。
+- 事件 `WAKE-001-20261008-start`：已按批准的 Luna/max 原开发聊天开始；验证先走隔离 EXE。见需求执行记录。
+- 事件 `WAKE-001-20261008-verified-awaiting-deployment`：只读检查、未知态和布局已实现，`build`、`verify`（含 WakeReadiness/WakeReadinessLayout）及 diff check 通过；实现提交 `6c3743b`、状态记录提交 `3f58e44`。PID 15968 仍打开固定原 EXE 0.18.0，正式启动文件/后台副本尚未更新；开发已停止活动命令并释放执行槽，等待用户关闭窗口后原路径交付。没有改用户任务、数据、电源设置或进行真实请求、桌面检查、睡眠演练。状态 `implementation_verified / awaiting_deployment`，不得写成已安装或实机验收。
+- 事件 `WAKE-001-20261008-delivered`：原窗口退出后，固定 EXE 与任务引用后台副本均已更新为 0.19.0、SHA-256 `581C58D8B21D001511122D97D7F88BE0D4A4805A05D9051217242F14CF562018`；正式 build/verify/diff 通过，任务 XML、应用数据和电源设置未变，临时任务清理，本地 tag `v0.19.0`，无 push。当前只读检查显示 AC/DC 唤醒计时器均开启，合盖动作被 Windows 隐藏，界面应标为未确认；真实合盖唤醒、桌面视觉和真实请求未测。开发 turn 已 completed/idle，执行槽释放，状态 `implementation_completed / awaiting_acceptance`。
+
 ## 2026-10-08 RESULT-001 已交付，待验收
 
 - 用户要求继续逐项优化列表，优先选取已由用户提出且 P1 的最近成功联通。权威需求 `docs/requirements/REQ-20261007-last-successful-connection.md` 已于 2026-10-08 经用户回复 `1` 确认，批准 `gpt-6.1-sol / medium`、单聊天串行与确定性验证；原开发聊天已完成实现、验证与原路径更新，待用户验收。
